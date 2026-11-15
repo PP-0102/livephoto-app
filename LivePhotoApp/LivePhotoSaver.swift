@@ -1,6 +1,9 @@
+import AVFoundation
 import Foundation
+import ImageIO
 import Photos
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - Errors
 
@@ -9,6 +12,7 @@ enum SaverError: LocalizedError {
     case downloadFailed
     case invalidImage
     case jpegEncodeFailed
+    case videoRemuxFailed
     case saveFailed
 
     var errorDescription: String? {
@@ -17,6 +21,7 @@ enum SaverError: LocalizedError {
         case .downloadFailed: return "下载失败，请检查网络后重试"
         case .invalidImage: return "图片解码失败"
         case .jpegEncodeFailed: return "图片转换失败"
+        case .videoRemuxFailed: return "视频转换失败"
         case .saveFailed: return "保存到相册失败，请重试"
         }
     }
@@ -27,11 +32,16 @@ enum SaverError: LocalizedError {
 /// Downloads one Live Photo (still + motion clip) and saves it to Photos
 /// as a real Live Photo (long-press to play, LIVE badge).
 ///
-/// The still is a WebP image: decode it with UIImage and re-encode as JPEG.
-/// The motion clip is an h264 mp4: its bytes are written to a .mov path
-/// (the h264 stream is compatible with the QuickTime container).
-/// Both resources are added to a single PHAssetCreationRequest, which is
-/// how Photos pairs them into one Live Photo asset.
+/// A real Live Photo needs the still and the clip to share ONE content
+/// identifier, or Photos will not pair them (and may reject the save):
+///   - JPEG: EXIF MakerNote = binary plist {17: <uuid>}
+///   - MOV:  QuickTime metadata com.apple.quicktime.content.identifier
+///
+/// The still is a WebP image: decode it with UIImage and write it out as
+/// JPEG with the MakerNote. The motion clip is an h264 mp4: remux it to a
+/// proper QuickTime .mov (passthrough, no re-encode) and write the content
+/// identifier into it. Both are then added to a single
+/// PHAssetCreationRequest, which is how Photos pairs them into one asset.
 struct LivePhotoSaver {
 
     /// Request add-only Photo Library access. Returns true if granted.
@@ -45,40 +55,39 @@ struct LivePhotoSaver {
         // 1. Download the still (WebP) and the motion clip (mp4).
         let (stillData, videoData) = try await download(item: item)
 
-        // 2. Decode the WebP still and re-encode it as JPEG.
-        guard let image = UIImage(data: stillData) else {
+        // 2. Decode the WebP still.
+        guard let image = UIImage(data: stillData), let cgImage = image.cgImage else {
             throw SaverError.invalidImage
         }
-        guard let jpegData = image.jpegData(compressionQuality: 0.92) else {
-            throw SaverError.jpegEncodeFailed
-        }
 
-        // 3. Write both parts to temp files.
+        // 3. One shared content identifier for the still and the clip.
+        let contentIdentifier = UUID().uuidString.uppercased()
+
+        // 4. Write the tagged JPEG still and the remuxed + tagged .mov clip.
         let tempDir = FileManager.default.temporaryDirectory
         let base = UUID().uuidString
         let jpgURL = tempDir.appendingPathComponent(base + ".jpg")
+        let mp4URL = tempDir.appendingPathComponent(base + ".mp4")
         let movURL = tempDir.appendingPathComponent(base + ".mov")
-        do {
-            try jpegData.write(to: jpgURL, options: [.atomic])
-            try videoData.write(to: movURL, options: [.atomic])
-        } catch {
+        defer {
             try? FileManager.default.removeItem(at: jpgURL)
+            try? FileManager.default.removeItem(at: mp4URL)
             try? FileManager.default.removeItem(at: movURL)
+        }
+        do {
+            try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
+                          contentIdentifier: contentIdentifier)
+            try videoData.write(to: mp4URL, options: [.atomic])
+            try await remuxAndTagVideo(inputURL: mp4URL, outputURL: movURL,
+                                       contentIdentifier: contentIdentifier)
+        } catch let error as SaverError {
+            throw error
+        } catch {
             throw SaverError.saveFailed
         }
 
-        // 4. Save as one Live Photo asset (.photo + .pairedVideo).
-        do {
-            try await performSave(jpgURL: jpgURL, movURL: movURL)
-        } catch {
-            try? FileManager.default.removeItem(at: jpgURL)
-            try? FileManager.default.removeItem(at: movURL)
-            throw error
-        }
-
-        // 5. Clean up temp files.
-        try? FileManager.default.removeItem(at: jpgURL)
-        try? FileManager.default.removeItem(at: movURL)
+        // 5. Save as one Live Photo asset (.photo + .pairedVideo).
+        try await performSave(jpgURL: jpgURL, movURL: movURL)
     }
 
     // MARK: - Helpers
@@ -99,6 +108,96 @@ struct LivePhotoSaver {
             throw SaverError.downloadFailed
         }
         return data
+    }
+
+    /// Write the still as JPEG with the EXIF MakerNote carrying the content
+    /// identifier (binary plist {17: <uuid>}).
+    private static func writeJPEG(image: UIImage, cgImage: CGImage, to url: URL,
+                                  contentIdentifier: String) throws {
+        let plistData = makerNotePlist(contentIdentifier: contentIdentifier)
+        let exif: [String: Any] = [kCGImagePropertyExifMakerNote as String: plistData]
+        let tiff: [String: Any] = [
+            kCGImagePropertyTIFFOrientation as String: exifOrientation(for: image.imageOrientation)
+        ]
+        let metadata: [String: Any] = [
+            kCGImagePropertyExifDictionary as String: exif,
+            kCGImagePropertyTIFFDictionary as String: tiff
+        ]
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw SaverError.jpegEncodeFailed
+        }
+        CGImageDestinationSetProperties(
+            dest, [kCGImageDestinationLossyCompressionQuality as String: 0.92] as CFDictionary)
+        CGImageDestinationAddImage(dest, cgImage, metadata as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else {
+            throw SaverError.jpegEncodeFailed
+        }
+    }
+
+    /// Remux the mp4 clip to a proper QuickTime .mov (passthrough, no
+    /// re-encode) and write the content identifier into it as QuickTime
+    /// metadata (com.apple.quicktime.content.identifier).
+    private static func remuxAndTagVideo(inputURL: URL, outputURL: URL,
+                                         contentIdentifier: String) async throws {
+        let asset = AVURLAsset(url: inputURL)
+        guard let exportSession = AVAssetExportSession(
+            asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            throw SaverError.videoRemuxFailed
+        }
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .mov
+        let item = AVMutableMetadataItem()
+        item.identifier = AVMetadataIdentifier.quickTimeMetadataContentIdentifier
+        item.value = contentIdentifier as NSString
+        item.dataType = "com.apple.metadata.datatype.UTF-8"
+        exportSession.metadata = [item]
+        await exportSession.export()
+        guard exportSession.status == .completed else {
+            throw exportSession.error ?? SaverError.videoRemuxFailed
+        }
+    }
+
+    /// Binary plist {17: <uuid>} for the JPEG MakerNote. Built byte by byte
+    /// because PropertyListSerialization refuses integer dictionary keys.
+    private static func makerNotePlist(contentIdentifier: String) -> Data {
+        let uuidData = contentIdentifier.data(using: .ascii) ?? Data()
+        var data = Data()
+        data.append(contentsOf: [UInt8]("bplist00".utf8))
+        data.append(contentsOf: [0xD1, 0x01, 0x02])   // dict, 1 entry
+        data.append(contentsOf: [0x10, 0x11])         // int 17
+        data.append(contentsOf: [0x5F, 0x10, UInt8(uuidData.count)])  // ascii string
+        data.append(uuidData)
+        let off0 = 8
+        let off1 = off0 + 3
+        let off2 = off1 + 2
+        let offTab = off2 + 3 + uuidData.count
+        data.append(contentsOf: [UInt8(off0), UInt8(off1), UInt8(off2)])  // offset table
+        data.append(contentsOf: [UInt8](repeating: 0, count: 6))
+        data.append(contentsOf: [1, 1])
+        data.append(contentsOf: bigEndianBytes(UInt64(3)))       // object count
+        data.append(contentsOf: bigEndianBytes(UInt64(0)))       // top object
+        data.append(contentsOf: bigEndianBytes(UInt64(offTab)))  // offset table offset
+        return data
+    }
+
+    private static func bigEndianBytes(_ value: UInt64) -> [UInt8] {
+        withUnsafeBytes(of: value.bigEndian, Array.init)
+    }
+
+    /// EXIF orientation (1-8) for a UIImage orientation.
+    private static func exifOrientation(for orientation: UIImage.Orientation) -> Int {
+        switch orientation {
+        case .up: return 1
+        case .down: return 3
+        case .left: return 8
+        case .right: return 6
+        case .upMirrored: return 2
+        case .downMirrored: return 4
+        case .leftMirrored: return 5
+        case .rightMirrored: return 7
+        @unknown default: return 1
+        }
     }
 
     /// One creation request with both resources; Photos pairs them into a

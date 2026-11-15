@@ -69,7 +69,8 @@ final class LivePhotoViewModel: ObservableObject {
                 count += 1
                 status = "已保存 \(count)/\(items.count)"
             } catch {
-                status = "第 \(item.id) 张保存失败，已跳过（已保存 \(count)/\(items.count)）"
+                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                status = "第 \(item.id) 张保存失败（\(reason)），已跳过（已保存 \(count)/\(items.count)）"
             }
         }
         isSavingAll = false
