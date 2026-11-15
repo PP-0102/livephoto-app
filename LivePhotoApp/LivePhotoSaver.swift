@@ -48,9 +48,11 @@ enum SaverError: LocalizedError {
 /// so Photos can pair the still and the clip into one Live Photo asset.
 struct LivePhotoSaver {
 
-    /// Request add-only Photo Library access. Returns true if granted.
+    /// Request full Photo Library access. Live Photo creation (a photo
+    /// paired with a video) needs read-write access, not add-only: with
+    /// add-only, Photos could not complete the paired save (error 3300).
     static func requestAccess() async -> Bool {
-        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         return status == .authorized || status == .limited
     }
 
@@ -74,9 +76,11 @@ struct LivePhotoSaver {
         let mp4URL = tempDir.appendingPathComponent(base + ".mp4")
         let movURL = tempDir.appendingPathComponent(base + ".mov")
         defer {
-            try? FileManager.default.removeItem(at: jpgURL)
+            // Only the source mp4 is removed here. The jpg/mov are handed
+            // to Photos by file URL and the daemon may still read them
+            // after the save call returns (video conversion runs async),
+            // so they are left for the system's temp-directory purge.
             try? FileManager.default.removeItem(at: mp4URL)
-            try? FileManager.default.removeItem(at: movURL)
         }
         do {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
@@ -90,10 +94,9 @@ struct LivePhotoSaver {
             throw SaverError.saveFailed
         }
 
-        // 5. Save as one Live Photo asset (.photo + .pairedVideo), passing
-        // the file contents as Data instead of file URLs: the Photos daemon
-        // reads Data directly, which avoids any sandbox/temp-path issue
-        // with the file URLs (a remaining suspect for error -1).
+        // 5. Save as one Live Photo asset (.photo + .pairedVideo) from the
+        // prepared files. The temp files stay alive until performSave
+        // returns (defer runs after), so the Photos daemon can read them.
         try await performSave(jpgURL: jpgURL, movURL: movURL)
     }
 
@@ -686,23 +689,18 @@ struct LivePhotoSaver {
         }
     }
 
-    /// One creation request with both resources, passed as Data (not file
-    /// URLs) so the Photos daemon reads the bytes directly. Photos pairs
-    /// them into a single Live Photo asset.
+    /// One creation request with both resources, passed as file URLs.
+    /// File URLs are used (not in-memory Data) because the Photos daemon
+    /// and its video converter read the paired video from disk by path;
+    /// passing the video as Data left the converter unable to process it
+    /// (PHPhotosErrorDomain 3300). This matches the reference app
+    /// (红薯秀), whose native converter also hands Photos file URLs.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        let jpgData: Data
-        let movData: Data
-        do {
-            jpgData = try Data(contentsOf: jpgURL)
-            movData = try Data(contentsOf: movURL)
-        } catch {
-            throw SaverError.saveFailed
-        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: jpgData, options: nil)
-                request.addResource(with: .pairedVideo, data: movData, options: nil)
+                request.addResource(with: .photo, fileURL: jpgURL, options: nil)
+                request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
             }, completionHandler: { success, error in
                 if let error = error {
                     continuation.resume(throwing: error)
