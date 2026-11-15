@@ -11,6 +11,24 @@ struct ImageItem: Identifiable {
     let height: Int
 }
 
+/// One video found inside a Xiaohongshu note (a video note has one).
+struct VideoItem: Identifiable {
+    let id: String          // "video"
+    let videoURL: URL       // original-quality video (sns-video-bd origin key)
+    let fallbackURL: URL    // stream masterUrl, used if the origin fails
+    let coverURL: URL?      // video cover image (imageList[0].urlDefault)
+    let width: Int
+    let height: Int
+    let durationMs: Int
+    let title: String
+}
+
+/// Everything parsed from one note: its images and (for a video note) its video.
+struct NoteMedia {
+    let images: [ImageItem]
+    let video: VideoItem?
+}
+
 // MARK: - Errors
 
 enum ResolverError: LocalizedError {
@@ -20,7 +38,7 @@ enum ResolverError: LocalizedError {
     case stateNotFound
     case stateParseFailed
     case noteNotFound
-    case noImages
+    case noMedia
 
     var errorDescription: String? {
         switch self {
@@ -30,7 +48,7 @@ enum ResolverError: LocalizedError {
         case .stateNotFound: return "没有解析到笔记数据，链接可能已过期，请重新复制链接再试"
         case .stateParseFailed: return "笔记数据解析失败，请重新复制链接再试"
         case .noteNotFound: return "没有找到这篇笔记，请检查链接是否正确"
-        case .noImages: return "这篇笔记里没有图片"
+        case .noMedia: return "这篇笔记里没有图片或视频"
         }
     }
 }
@@ -97,8 +115,9 @@ struct ImageResolver {
         return html
     }
 
-    /// Parse the note page HTML and return ALL images it contains.
-    static func parseImages(from html: String) throws -> [ImageItem] {
+    /// Parse the note page HTML and return ALL images and (for a video
+    /// note) the video it contains.
+    static func parseMedia(from html: String) throws -> NoteMedia {
         guard let rawState = extractInitialState(from: html) else {
             throw ResolverError.stateNotFound
         }
@@ -121,39 +140,126 @@ struct ImageResolver {
         else {
             throw ResolverError.noteNotFound
         }
-        guard let imageList = note["imageList"] as? [[String: Any]] else {
-            throw ResolverError.noImages
-        }
+
+        // Video (a video note has one). Parsed first so the cover image
+        // (imageList[0]) can be dropped from the image list below.
+        let video = parseVideo(from: note)
 
         var items: [ImageItem] = []
-        for (index, image) in imageList.enumerated() {
-            guard let imageString = image["urlDefault"] as? String,
-                  let fallbackURL = URL(string: httpsURL(imageString))
-            else { continue }
-            // Original quality: rebuild the CDN URL from the image's fileId.
-            // The web urlDefault is capped at 1080px; the same file on
-            // sns-img-bd with imageView2 w/0 returns the full-resolution
-            // original as a JPEG. Falls back to urlDefault when the fileId
-            // cannot be derived.
-            let imageURL = originalURL(from: imageString) ?? fallbackURL
-            let width = (image["width"] as? NSNumber)?.intValue ?? 0
-            let height = (image["height"] as? NSNumber)?.intValue ?? 0
-            items.append(ImageItem(
-                id: "\(index + 1)",
-                imageURL: imageURL,
-                fallbackURL: fallbackURL,
-                width: width,
-                height: height
-            ))
+        if let imageList = note["imageList"] as? [[String: Any]] {
+            // For a video note, imageList[0] is just the video cover —
+            // skip it so the cover does not also appear as "图片 1".
+            let startIndex = video == nil ? 0 : 1
+            for (offset, image) in imageList.enumerated().dropFirst(startIndex) {
+                guard let imageString = image["urlDefault"] as? String,
+                      let fallbackURL = URL(string: httpsURL(imageString))
+                else { continue }
+                // Original quality: rebuild the CDN URL from the image's fileId.
+                // The web urlDefault is capped at 1080px; the same file on
+                // sns-img-bd with imageView2 w/0 returns the full-resolution
+                // original as a JPEG. Falls back to urlDefault when the fileId
+                // cannot be derived.
+                let imageURL = originalURL(from: imageString) ?? fallbackURL
+                let width = (image["width"] as? NSNumber)?.intValue ?? 0
+                let height = (image["height"] as? NSNumber)?.intValue ?? 0
+                items.append(ImageItem(
+                    id: "\(offset + 1)",
+                    imageURL: imageURL,
+                    fallbackURL: fallbackURL,
+                    width: width,
+                    height: height
+                ))
+            }
         }
-        guard !items.isEmpty else { throw ResolverError.noImages }
-        return items
+        guard !items.isEmpty || video != nil else { throw ResolverError.noMedia }
+        return NoteMedia(images: items, video: video)
     }
 
-    /// Convenience: fetch a link and return its images in one call.
-    static func resolve(link: String) async throws -> [ImageItem] {
+    /// Parse the video out of a note dictionary. Returns nil for an image
+    /// note (no `video` field) or when no playable URL can be found.
+    /// Prefers the original-quality file (consumer.originVideoKey on
+    /// sns-video-bd); falls back to the best stream masterUrl.
+    private static func parseVideo(from note: [String: Any]) -> VideoItem? {
+        guard let video = note["video"] as? [String: Any] else { return nil }
+        let media = video["media"] as? [String: Any]
+
+        // Collect stream URLs: stream can be an array, or an object keyed
+        // by codec ({h264: [...], h265: [...]}). Prefer the largest.
+        var streams: [(url: String, width: Int, height: Int)] = []
+        if let rawStream = media?["stream"] {
+            var list: [[String: Any]] = []
+            if let arr = rawStream as? [[String: Any]] {
+                list = arr
+            } else if let dict = rawStream as? [String: Any] {
+                for value in dict.values {
+                    if let arr = value as? [[String: Any]] { list += arr }
+                }
+            }
+            for s in list {
+                let url = (s["masterUrl"] as? String)
+                    ?? (s["backupUrls"] as? [String])?.first
+                guard let url, !url.isEmpty else { continue }
+                streams.append((
+                    url: url,
+                    width: (s["width"] as? NSNumber)?.intValue ?? 0,
+                    height: (s["height"] as? NSNumber)?.intValue ?? 0
+                ))
+            }
+        }
+        streams.sort { ($0.width * $0.height) > ($1.width * $1.height) }
+
+        // Original: consumer.originVideoKey -> sns-video-bd.
+        var originURL: URL? = nil
+        if let consumer = video["consumer"] as? [String: Any],
+           let key = consumer["originVideoKey"] as? String, !key.isEmpty {
+            originURL = URL(string: "https://sns-video-bd.xhscdn.com/\(key)")
+        }
+        guard let fallback = streams.first,
+              let fallbackURL = URL(string: httpsURL(fallback.url))
+        else {
+            // No stream at all; the origin alone is still playable.
+            guard let origin = originURL else { return nil }
+            return makeVideoItem(note: note, media: media, videoURL: origin, fallbackURL: origin)
+        }
+        let videoURL = originURL ?? fallbackURL
+        return makeVideoItem(note: note, media: media, videoURL: videoURL, fallbackURL: fallbackURL)
+    }
+
+    private static func makeVideoItem(
+        note: [String: Any],
+        media: [String: Any]?,
+        videoURL: URL,
+        fallbackURL: URL
+    ) -> VideoItem {
+        // Cover: imageList[0].urlDefault, or the video's own cover.
+        var coverURL: URL? = nil
+        if let imageList = note["imageList"] as? [[String: Any]],
+           let coverString = imageList.first?["urlDefault"] as? String {
+            coverURL = URL(string: httpsURL(coverString))
+        } else if let coverString = media?["cover"] as? String {
+            coverURL = URL(string: httpsURL(coverString))
+        }
+        let durationMs = (media?["duration"] as? NSNumber)?.intValue ?? 0
+        let title = (note["title"] as? String) ?? (note["desc"] as? String) ?? "小红书视频"
+        // Width/height from the stream are lost here; keep the note's dims.
+        let width = (note["width"] as? NSNumber)?.intValue ?? 0
+        let height = (note["height"] as? NSNumber)?.intValue ?? 0
+        return VideoItem(
+            id: "video",
+            videoURL: videoURL,
+            fallbackURL: fallbackURL,
+            coverURL: coverURL,
+            width: width,
+            height: height,
+            durationMs: durationMs,
+            title: title
+        )
+    }
+
+    /// Convenience: fetch a link and return its images and video in one call.
+    static func resolve(link: String) async throws -> NoteMedia {
         let html = try await fetchNoteHTML(link: link)
-        return try parseImages(from: html)
+        return try parseMedia(from: html)
     }
 
     // MARK: - Helpers

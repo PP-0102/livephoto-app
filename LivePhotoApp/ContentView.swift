@@ -7,13 +7,16 @@ import UIKit
 final class ImageViewModel: ObservableObject {
     @Published var linkText = ""
     @Published var items: [ImageItem] = []
+    @Published var video: VideoItem? = nil
     @Published var status = ""
     @Published var isParsing = false
     @Published var isSavingAll = false
     @Published var savedIDs: Set<String> = []
     @Published var savingIDs: Set<String> = []
+    @Published var isVideoSaved = false
+    @Published var isVideoSaving = false
 
-    /// Parse the pasted link and list the images in the note.
+    /// Parse the pasted link and list the images (and video) in the note.
     func parse() async {
         let link = linkText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !link.isEmpty else {
@@ -22,16 +25,44 @@ final class ImageViewModel: ObservableObject {
         }
         isParsing = true
         items = []
+        video = nil
         savedIDs = []
+        isVideoSaved = false
         status = "正在解析…"
         do {
-            let found = try await ImageResolver.resolve(link: link)
-            items = found
-            status = "找到 \(found.count) 张图片"
+            let media = try await ImageResolver.resolve(link: link)
+            items = media.images
+            video = media.video
+            if media.video != nil {
+                status = items.isEmpty
+                    ? "找到 1 个视频"
+                    : "找到 1 个视频和 \(items.count) 张图片"
+            } else {
+                status = "找到 \(items.count) 张图片"
+            }
         } catch {
             status = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
         isParsing = false
+    }
+
+    /// Save the video to the Photos library.
+    func saveVideo() async {
+        guard let video, !isVideoSaved, !isVideoSaving else { return }
+        isVideoSaving = true
+        do {
+            guard await ImageSaver.requestAccess() else {
+                status = SaverError.photoAccessDenied.errorDescription ?? "没有相册权限"
+                isVideoSaving = false
+                return
+            }
+            try await ImageSaver.saveVideo(item: video)
+            isVideoSaved = true
+            status = "视频已保存到相册"
+        } catch {
+            status = "视频保存失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+        }
+        isVideoSaving = false
     }
 
     /// Save one image to the Photos library.
@@ -91,19 +122,25 @@ final class ImageViewModel: ObservableObject {
     func clear() {
         linkText = ""
         items = []
+        video = nil
         status = ""
         savedIDs = []
         savingIDs = []
+        isVideoSaved = false
+        isVideoSaving = false
     }
 
-    /// One-tap download: parse the link (if not parsed yet) and save every
-    /// image to the Photos library.
+    /// One-tap download: parse the link (if not parsed yet) and save the
+    /// video and every image to the Photos library.
     func downloadAll() async {
         guard !isParsing, !isSavingAll else { return }
-        if items.isEmpty {
+        if items.isEmpty && video == nil {
             await parse()
         }
-        guard !items.isEmpty else { return }
+        guard !items.isEmpty || video != nil else { return }
+        if video != nil {
+            await saveVideo()
+        }
         await saveAll()
     }
 }
@@ -179,6 +216,18 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
+                // Video card (for a video note)
+                if let video = viewModel.video {
+                    VideoRow(
+                        item: video,
+                        isSaved: viewModel.isVideoSaved,
+                        isSaving: viewModel.isVideoSaving,
+                        onSave: {
+                            Task { await viewModel.saveVideo() }
+                        }
+                    )
+                }
+
                 // Save all
                 if !viewModel.items.isEmpty {
                     Button(action: {
@@ -218,6 +267,75 @@ struct ContentView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Video row
+
+struct VideoRow: View {
+    let item: VideoItem
+    let isSaved: Bool
+    let isSaving: Bool
+    let onSave: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Cover thumbnail with a play badge.
+            ZStack(alignment: .center) {
+                AsyncImage(url: item.coverURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        Color.gray.opacity(0.3)
+                            .overlay(Image(systemName: "video").foregroundColor(.secondary))
+                    default:
+                        ProgressView()
+                    }
+                }
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundColor(.white)
+                    .shadow(radius: 2)
+            }
+            .frame(width: 72, height: 96)
+            .clipped()
+            .cornerRadius(8)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.title)
+                    .font(.headline)
+                    .lineLimit(2)
+                if item.durationMs > 0 {
+                    Text("时长 \(item.durationMs / 1000) 秒")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Text(isSaved ? "已保存到相册" : "原画视频")
+                    .font(.caption)
+                    .foregroundColor(isSaved ? .green : .secondary)
+            }
+
+            Spacer()
+
+            Button(action: onSave) {
+                if isSaving {
+                    ProgressView()
+                } else if isSaved {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                } else {
+                    Text("保存视频")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isSaved || isSaving)
+        }
+        .padding(.vertical, 4)
     }
 }
 
