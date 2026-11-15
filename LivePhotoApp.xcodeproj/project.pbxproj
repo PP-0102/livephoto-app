@@ -7,18 +7,18 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		993506192FF9415BA8EC395A /* LivePhotoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B71814171840BF89EB05B5 /* LivePhotoApp.swift */; };
+		993506192FF9415BA8EC395A /* ImageDownloadApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B71814171840BF89EB05B5 /* ImageDownloadApp.swift */; };
 		576AF1C3AA0F4A61B06FF60D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB773C909B81480499E653E2 /* ContentView.swift */; };
-		785B204EC24A4C03B96F9CE7 /* XiaohongshuResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21AD3E87B84943508D0B5C79 /* XiaohongshuResolver.swift */; };
-		A1632E6B3BF94133A21EC63A /* LivePhotoSaver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C2628D42C341C2B5EC95A3 /* LivePhotoSaver.swift */; };
+		785B204EC24A4C03B96F9CE7 /* ImageResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21AD3E87B84943508D0B5C79 /* ImageResolver.swift */; };
+		A1632E6B3BF94133A21EC63A /* ImageSaver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C2628D42C341C2B5EC95A3 /* ImageSaver.swift */; };
 		F611ED3276C9439F90182C17 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B0AED11EB7454FB9FE5687 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		25B71814171840BF89EB05B5 /* LivePhotoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivePhotoApp.swift; sourceTree = "<group>"; };
+		25B71814171840BF89EB05B5 /* ImageDownloadApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageDownloadApp.swift; sourceTree = "<group>"; };
 		BB773C909B81480499E653E2 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		21AD3E87B84943508D0B5C79 /* XiaohongshuResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XiaohongshuResolver.swift; sourceTree = "<group>"; };
-		36C2628D42C341C2B5EC95A3 /* LivePhotoSaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivePhotoSaver.swift; sourceTree = "<group>"; };
+		21AD3E87B84943508D0B5C79 /* ImageResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageResolver.swift; sourceTree = "<group>"; };
+		36C2628D42C341C2B5EC95A3 /* ImageSaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageSaver.swift; sourceTree = "<group>"; };
 		6E4CC36CD64548348133217F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B0B0AED11EB7454FB9FE5687 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8F217EA33E3A4FF68BEFC1BF /* LivePhotoApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LivePhotoApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -46,10 +46,10 @@
 		48AC83AF32654A86A854061D /* LivePhotoApp */ = {
 			isa = PBXGroup;
 			children = (
-				25B71814171840BF89EB05B5 /* LivePhotoApp.swift */,
+				25B71814171840BF89EB05B5 /* ImageDownloadApp.swift */,
 				BB773C909B81480499E653E2 /* ContentView.swift */,
-				21AD3E87B84943508D0B5C79 /* XiaohongshuResolver.swift */,
-				36C2628D42C341C2B5EC95A3 /* LivePhotoSaver.swift */,
+				21AD3E87B84943508D0B5C79 /* ImageResolver.swift */,
+				36C2628D42C341C2B5EC95A3 /* ImageSaver.swift */,
 				B0B0AED11EB7454FB9FE5687 /* Assets.xcassets */,
 				6E4CC36CD64548348133217F /* Info.plist */,
 			);
@@ -133,10 +133,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				993506192FF9415BA8EC395A /* LivePhotoApp.swift in Sources */,
+				993506192FF9415BA8EC395A /* ImageDownloadApp.swift in Sources */,
 				576AF1C3AA0F4A61B06FF60D /* ContentView.swift in Sources */,
-				785B204EC24A4C03B96F9CE7 /* XiaohongshuResolver.swift in Sources */,
-				A1632E6B3BF94133A21EC63A /* LivePhotoSaver.swift in Sources */,
+				785B204EC24A4C03B96F9CE7 /* ImageResolver.swift in Sources */,
+				A1632E6B3BF94133A21EC63A /* ImageSaver.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -280,7 +280,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hatoyo.livephoto;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hatoyo.imagedownload;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -300,7 +300,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hatoyo.livephoto;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hatoyo.imagedownload;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
