@@ -88,8 +88,118 @@ struct LivePhotoSaver {
             throw SaverError.saveFailed
         }
 
-        // 5. Save as one Live Photo asset (.photo + .pairedVideo).
+        // 5. Save as one Live Photo asset (.photo + .pairedVideo), passing
+        // the file contents as Data instead of file URLs: the Photos daemon
+        // reads Data directly, which avoids any sandbox/temp-path issue
+        // with the file URLs (a remaining suspect for error -1).
         try await performSave(jpgURL: jpgURL, movURL: movURL)
+    }
+
+    /// Build a .livp file (ZIP of the tagged JPEG still + tagged MOV clip
+    /// sharing one content identifier) and return it as Data. A .livp is
+    /// the format iOS itself uses for Live Photos; opening one in Files
+    /// imports it as a real Live Photo. This is the fallback when the
+    /// direct Photos save keeps failing.
+    static func makeLivpData(item: LivePhotoItem) async throws -> Data {
+        let (stillData, videoData) = try await download(item: item)
+        guard let image = UIImage(data: stillData), let cgImage = image.cgImage else {
+            throw SaverError.invalidImage
+        }
+        let contentIdentifier = UUID().uuidString.uppercased()
+        let tempDir = FileManager.default.temporaryDirectory
+        let base = UUID().uuidString
+        let jpgURL = tempDir.appendingPathComponent(base + ".jpg")
+        let mp4URL = tempDir.appendingPathComponent(base + ".mp4")
+        let movURL = tempDir.appendingPathComponent(base + ".mov")
+        defer {
+            try? FileManager.default.removeItem(at: jpgURL)
+            try? FileManager.default.removeItem(at: mp4URL)
+            try? FileManager.default.removeItem(at: movURL)
+        }
+        do {
+            try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
+                          contentIdentifier: contentIdentifier)
+            try videoData.write(to: mp4URL, options: [.atomic])
+            try await transcodeAndTagVideo(inputURL: mp4URL, outputURL: movURL,
+                                           contentIdentifier: contentIdentifier)
+        } catch let error as SaverError {
+            throw error
+        } catch {
+            throw SaverError.saveFailed
+        }
+        let jpgData = try Data(contentsOf: jpgURL)
+        let movData = try Data(contentsOf: movURL)
+        let stem = "IMG_\(item.id)"
+        return zipStored(files: [(stem + ".JPG", jpgData), (stem + ".MOV", movData)])
+    }
+
+    /// Minimal ZIP writer (stored entries, no compression). Sufficient for
+    /// .livp, which iOS reads as a Live Photo container.
+    private static func zipStored(files: [(name: String, data: Data)]) -> Data {
+        var out = Data()
+        var central = Data()
+        for file in files {
+            let nameBytes = Array(file.name.utf8)
+            let crc = crc32(file.data)
+            let localOffset = UInt32(out.count)
+            // Local file header.
+            appendLE32(0x04034b50, to: &out)
+            appendLE16(20, to: &out)              // version needed
+            appendLE16(0x0800, to: &out)          // flags: UTF-8 filenames
+            appendLE16(0, to: &out)               // method: stored
+            appendLE16(0, to: &out)               // mod time
+            appendLE16(0x21, to: &out)            // mod date (1980-01-01)
+            appendLE32(crc, to: &out)
+            appendLE32(UInt32(file.data.count), to: &out)
+            appendLE32(UInt32(file.data.count), to: &out)
+            appendLE16(UInt16(nameBytes.count), to: &out)
+            appendLE16(0, to: &out)               // extra length
+            out.append(contentsOf: nameBytes)
+            out.append(file.data)
+            // Central directory entry.
+            appendLE32(0x02014b50, to: &central)
+            appendLE16(20, to: &central)          // version made by
+            appendLE16(20, to: &central)          // version needed
+            appendLE16(0x0800, to: &central)      // flags: UTF-8
+            appendLE16(0, to: &central)           // method: stored
+            appendLE16(0, to: &central)           // mod time
+            appendLE16(0x21, to: &central)        // mod date
+            appendLE32(crc, to: &central)
+            appendLE32(UInt32(file.data.count), to: &central)
+            appendLE32(UInt32(file.data.count), to: &central)
+            appendLE16(UInt16(nameBytes.count), to: &central)
+            appendLE16(0, to: &central)           // extra
+            appendLE16(0, to: &central)           // comment
+            appendLE16(0, to: &central)           // disk number
+            appendLE16(0, to: &central)           // internal attrs
+            appendLE32(0, to: &central)           // external attrs
+            appendLE32(localOffset, to: &central)
+            central.append(contentsOf: nameBytes)
+        }
+        let centralOffset = UInt32(out.count)
+        out.append(central)
+        // End of central directory.
+        appendLE32(0x06054b50, to: &out)
+        appendLE16(0, to: &out)                   // disk number
+        appendLE16(0, to: &out)                   // central dir disk
+        appendLE16(UInt16(files.count), to: &out)
+        appendLE16(UInt16(files.count), to: &out)
+        appendLE32(UInt32(central.count), to: &out)
+        appendLE32(centralOffset, to: &out)
+        appendLE16(0, to: &out)                   // comment length
+        return out
+    }
+
+    /// CRC-32 (IEEE, polynomial 0xEDB88320) for the ZIP entries.
+    private static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1)
+            }
+        }
+        return crc ^ 0xFFFFFFFF
     }
 
     // MARK: - Helpers
@@ -516,14 +626,23 @@ struct LivePhotoSaver {
         }
     }
 
-    /// One creation request with both resources; Photos pairs them into a
-    /// single Live Photo asset.
+    /// One creation request with both resources, passed as Data (not file
+    /// URLs) so the Photos daemon reads the bytes directly. Photos pairs
+    /// them into a single Live Photo asset.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
+        let jpgData: Data
+        let movData: Data
+        do {
+            jpgData = try Data(contentsOf: jpgURL)
+            movData = try Data(contentsOf: movURL)
+        } catch {
+            throw SaverError.saveFailed
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, fileURL: jpgURL, options: nil)
-                request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
+                request.addResource(with: .photo, data: jpgData, options: nil)
+                request.addResource(with: .pairedVideo, data: movData, options: nil)
             }, completionHandler: { success, error in
                 if let error = error {
                     continuation.resume(throwing: error)
