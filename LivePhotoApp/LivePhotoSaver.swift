@@ -102,6 +102,55 @@ struct LivePhotoSaver {
         try await performSave(jpgURL: jpgURL, movURL: movURL)
     }
 
+    /// Save one item's still as a plain static photo (no Live Photo
+    /// pairing, no video). This is the reliable fallback: a single .photo
+    /// resource needs no content identifier and no video conversion, so
+    /// it saves where the paired Live Photo save keeps failing.
+    static func saveStaticImage(item: LivePhotoItem) async throws {
+        let stillData: Data
+        do {
+            stillData = try await downloadData(from: item.stillURL)
+        } catch {
+            throw SaverError.downloadFailed
+        }
+        guard let image = UIImage(data: stillData), let cgImage = image.cgImage else {
+            throw SaverError.invalidImage
+        }
+        let tempDir = FileManager.default.temporaryDirectory
+        let jpgURL = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
+        defer { try? FileManager.default.removeItem(at: jpgURL) }
+        guard let dest = CGImageDestinationCreateWithURL(
+            jpgURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw SaverError.jpegEncodeFailed
+        }
+        CGImageDestinationSetProperties(
+            dest, [kCGImageDestinationLossyCompressionQuality as String: 0.92] as CFDictionary)
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw SaverError.jpegEncodeFailed
+        }
+        let jpgData: Data
+        do {
+            jpgData = try Data(contentsOf: jpgURL)
+        } catch {
+            throw SaverError.saveFailed
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges({
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: jpgData, options: nil)
+            }, completionHandler: { success, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: SaverError.saveFailed)
+                }
+            })
+        }
+    }
+
     /// Build a .livp file (ZIP of the tagged JPEG still + tagged MOV clip
     /// sharing one content identifier) and return it as Data. A .livp is
     /// the format iOS itself uses for Live Photos; opening one in Files

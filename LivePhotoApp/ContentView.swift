@@ -12,6 +12,8 @@ final class LivePhotoViewModel: ObservableObject {
     @Published var isSavingAll = false
     @Published var savedIDs: Set<String> = []
     @Published var savingIDs: Set<String> = []
+    @Published var savedStaticIDs: Set<String> = []
+    @Published var savingStaticIDs: Set<String> = []
 
     /// Parse the pasted link and list the Live Photos in the note.
     func parse() async {
@@ -79,6 +81,51 @@ final class LivePhotoViewModel: ObservableObject {
         }
     }
 
+    /// Save one item's still as a plain static photo to the Photos library.
+    func saveStatic(item: LivePhotoItem) async {
+        guard !savedStaticIDs.contains(item.id), !savingStaticIDs.contains(item.id) else { return }
+        savingStaticIDs.insert(item.id)
+        do {
+            guard await LivePhotoSaver.requestAccess() else {
+                status = SaverError.photoAccessDenied.errorDescription ?? "没有相册权限"
+                savingStaticIDs.remove(item.id)
+                return
+            }
+            try await LivePhotoSaver.saveStaticImage(item: item)
+            savedStaticIDs.insert(item.id)
+            status = "已保存图片 \(savedStaticIDs.count)/\(items.count)"
+        } catch {
+            status = "第 \(item.id) 张图片保存失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+        }
+        savingStaticIDs.remove(item.id)
+    }
+
+    /// Save every item's still as a plain static photo, one after another.
+    func saveAllStatic() async {
+        guard !items.isEmpty, !isSavingAll else { return }
+        guard await LivePhotoSaver.requestAccess() else {
+            status = SaverError.photoAccessDenied.errorDescription ?? "没有相册权限"
+            return
+        }
+        isSavingAll = true
+        var count = savedStaticIDs.count
+        for item in items where !savedStaticIDs.contains(item.id) {
+            do {
+                try await LivePhotoSaver.saveStaticImage(item: item)
+                savedStaticIDs.insert(item.id)
+                count += 1
+                status = "已保存图片 \(count)/\(items.count)"
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                status = "第 \(item.id) 张图片保存失败（\(reason)），已跳过（已保存图片 \(count)/\(items.count)）"
+            }
+        }
+        isSavingAll = false
+        if savedStaticIDs.count == items.count {
+            status = "全部图片保存完成，共 \(items.count) 张"
+        }
+    }
+
     /// Paste the link from the clipboard into the text field.
     func pasteFromClipboard() {
         if let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -94,6 +141,8 @@ final class LivePhotoViewModel: ObservableObject {
         status = ""
         savedIDs = []
         savingIDs = []
+        savedStaticIDs = []
+        savingStaticIDs = []
     }
 
     /// One-tap download: parse the link (if not parsed yet) and save every
@@ -215,13 +264,24 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
-                // Save all + export all as .livp files
+                // Save all + save all as static images + export all as .livp files
                 if !viewModel.items.isEmpty {
                     Button(action: {
                         linkFieldFocused = false
                         Task { await viewModel.saveAll() }
                     }) {
                         Text(viewModel.isSavingAll ? "正在保存…" : "全部保存（\(viewModel.items.count) 张）")
+                            .fontWeight(.semibold)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isSavingAll || isExporting)
+
+                    Button(action: {
+                        linkFieldFocused = false
+                        Task { await viewModel.saveAllStatic() }
+                    }) {
+                        Text(viewModel.isSavingAll ? "正在保存…" : "全部保存为图片（\(viewModel.items.count) 张）")
                             .fontWeight(.semibold)
                             .frame(maxWidth: .infinity)
                     }
@@ -257,8 +317,13 @@ struct ContentView: View {
                         item: item,
                         isSaved: viewModel.savedIDs.contains(item.id),
                         isSaving: viewModel.savingIDs.contains(item.id),
+                        isStaticSaved: viewModel.savedStaticIDs.contains(item.id),
+                        isStaticSaving: viewModel.savingStaticIDs.contains(item.id),
                         onSave: {
                             Task { await viewModel.save(item: item) }
+                        },
+                        onSaveStatic: {
+                            Task { await viewModel.saveStatic(item: item) }
                         },
                         onExport: {
                             Task {
@@ -308,7 +373,10 @@ struct LivePhotoRow: View {
     let item: LivePhotoItem
     let isSaved: Bool
     let isSaving: Bool
+    let isStaticSaved: Bool
+    let isStaticSaving: Bool
     let onSave: () -> Void
+    let onSaveStatic: () -> Void
     let onExport: () -> Void
 
     var body: some View {
@@ -339,9 +407,9 @@ struct LivePhotoRow: View {
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
-                Text(isSaved ? "已保存到相册" : "长按可播放")
+                Text(isSaved ? "已保存到相册" : isStaticSaved ? "已保存为图片" : "长按可播放")
                     .font(.caption)
-                    .foregroundColor(isSaved ? .green : .secondary)
+                    .foregroundColor(isSaved || isStaticSaved ? .green : .secondary)
             }
 
             Spacer()
@@ -361,6 +429,21 @@ struct LivePhotoRow: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(isSaved || isSaving)
+
+                Button(action: onSaveStatic) {
+                    if isStaticSaving {
+                        ProgressView()
+                    } else if isStaticSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    } else {
+                        Text("保存图片")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isStaticSaved || isStaticSaving)
 
                 Button(action: onExport) {
                     Text("导出实况文件")
