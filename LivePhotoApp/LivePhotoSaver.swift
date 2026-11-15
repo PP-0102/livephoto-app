@@ -78,7 +78,7 @@ struct LivePhotoSaver {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
                           contentIdentifier: contentIdentifier)
             try videoData.write(to: mp4URL, options: [.atomic])
-            try await remuxAndTagVideo(inputURL: mp4URL, outputURL: movURL,
+            try await transcodeAndTagVideo(inputURL: mp4URL, outputURL: movURL,
                                        contentIdentifier: contentIdentifier)
         } catch let error as SaverError {
             throw error
@@ -135,14 +135,20 @@ struct LivePhotoSaver {
         }
     }
 
-    /// Remux the mp4 clip to a proper QuickTime .mov (passthrough, no
-    /// re-encode) and write the content identifier into it as QuickTime
-    /// metadata (com.apple.quicktime.content.identifier).
-    private static func remuxAndTagVideo(inputURL: URL, outputURL: URL,
-                                         contentIdentifier: String) async throws {
+    /// Transcode the mp4 clip to a proper QuickTime .mov (full re-encode,
+    /// not passthrough) and write the content identifier into it as
+    /// QuickTime metadata (com.apple.quicktime.content.identifier).
+    /// Re-encoding (instead of passthrough) is what makes the export
+    /// session actually write the metadata and produce a clean .mov
+    /// that Photos accepts — passthrough copies the stream without
+    /// rewriting it, so the content identifier never lands in the file.
+    /// This mirrors the reference app (红薯秀), which FFmpeg-transcodes
+    /// the clip to .mov before handing it to its Live Photo converter.
+    private static func transcodeAndTagVideo(inputURL: URL, outputURL: URL,
+                                             contentIdentifier: String) async throws {
         let asset = AVURLAsset(url: inputURL)
         guard let exportSession = AVAssetExportSession(
-            asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw SaverError.videoRemuxFailed
         }
         exportSession.outputURL = outputURL
