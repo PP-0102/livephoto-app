@@ -38,12 +38,18 @@ struct ImageSaver {
     }
 
     /// Save one image item to the Photos library as a static photo.
+    /// Tries the original-quality URL first; if that download fails or
+    /// does not decode as an image, falls back to the 1080px web version.
     static func saveImage(item: ImageItem) async throws {
         let imageData: Data
         do {
-            imageData = try await downloadData(from: item.imageURL)
+            imageData = try await downloadImageData(from: item.imageURL)
         } catch {
-            throw SaverError.downloadFailed
+            do {
+                imageData = try await downloadImageData(from: item.fallbackURL)
+            } catch {
+                throw SaverError.downloadFailed
+            }
         }
         guard let image = UIImage(data: imageData), let cgImage = image.cgImage else {
             throw SaverError.invalidImage
@@ -83,10 +89,16 @@ struct ImageSaver {
         }
     }
 
-    private static func downloadData(from url: URL) async throws -> Data {
+    /// Download image data from a URL and verify it decodes as an image.
+    /// Throws when the request fails or the bytes are not a valid image,
+    /// so the caller can fall back to the other URL.
+    private static func downloadImageData(from url: URL) async throws -> Data {
         let (data, response) = try await URLSession.shared.data(from: url)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw SaverError.downloadFailed
+        }
+        guard UIImage(data: data) != nil else {
+            throw SaverError.invalidImage
         }
         return data
     }

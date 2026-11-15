@@ -5,7 +5,8 @@ import Foundation
 /// One image found inside a Xiaohongshu note.
 struct ImageItem: Identifiable {
     let id: String          // e.g. "1", "2", ... (index inside the note)
-    let imageURL: URL       // still image (urlDefault)
+    let imageURL: URL       // original-quality image (sns-img-bd, full resolution)
+    let fallbackURL: URL    // 1080px web version (urlDefault), used if the original fails
     let width: Int
     let height: Int
 }
@@ -127,13 +128,20 @@ struct ImageResolver {
         var items: [ImageItem] = []
         for (index, image) in imageList.enumerated() {
             guard let imageString = image["urlDefault"] as? String,
-                  let imageURL = URL(string: httpsURL(imageString))
+                  let fallbackURL = URL(string: httpsURL(imageString))
             else { continue }
+            // Original quality: rebuild the CDN URL from the image's fileId.
+            // The web urlDefault is capped at 1080px; the same file on
+            // sns-img-bd with imageView2 w/0 returns the full-resolution
+            // original as a JPEG. Falls back to urlDefault when the fileId
+            // cannot be derived.
+            let imageURL = originalURL(from: imageString) ?? fallbackURL
             let width = (image["width"] as? NSNumber)?.intValue ?? 0
             let height = (image["height"] as? NSNumber)?.intValue ?? 0
             items.append(ImageItem(
                 id: "\(index + 1)",
                 imageURL: imageURL,
+                fallbackURL: fallbackURL,
                 width: width,
                 height: height
             ))
@@ -178,6 +186,38 @@ struct ImageResolver {
             return "https://" + urlString.dropFirst("http://".count)
         }
         return urlString
+    }
+
+    /// Build the original-quality image URL from a urlDefault string.
+    ///
+    /// urlDefault points at sns-webpic-qc with a processing suffix
+    /// (!nd_dft_wlteh_webp_3) and is capped at 1080px wide. The same file
+    /// lives on sns-img-bd under its fileId; requesting it with
+    /// imageView2/2/w/0/format/jpg returns the full-resolution original
+    /// as a JPEG. The fileId is the path after the date/hash directories,
+    /// with the !suffix stripped (it may itself contain a prefix such as
+    /// notes_pre_post/ or spectrum/). Returns nil when the fileId cannot
+    /// be derived, in which case the caller falls back to urlDefault.
+    private static func originalURL(from urlDefault: String) -> URL? {
+        var path = urlDefault
+        // Strip the scheme and host, keeping only the path.
+        if let schemeRange = path.range(of: "://") {
+            path = String(path[schemeRange.upperBound...])
+        }
+        if let slash = path.firstIndex(of: "/") {
+            path = String(path[slash...])
+        } else {
+            return nil
+        }
+        let segments = path.split(separator: "/").map(String.init)
+        // Path is /<date>/<hash>/<fileId>[...] — fileId is segment 2 onward.
+        guard segments.count >= 3 else { return nil }
+        var fileId = segments[2...].joined(separator: "/")
+        if let bang = fileId.firstIndex(of: "!") {
+            fileId = String(fileId[..<bang])
+        }
+        guard !fileId.isEmpty else { return nil }
+        return URL(string: "https://sns-img-bd.xhscdn.com/\(fileId)?imageView2/2/w/0/format/jpg")
     }
 
     /// Extract the raw `window.__INITIAL_STATE__ = {...}` object literal text.
