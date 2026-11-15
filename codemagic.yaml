@@ -1,0 +1,49 @@
+# Codemagic workflow: build the LivePhotoApp as an UNSIGNED .ipa for
+# AltStore sideloading. No Apple Developer account / signing is required to
+# compile; AltStore signs the IPA on the user's own iPhone with their free
+# Apple ID. Free Apple IDs must refresh the app every 7 days (AltStore does
+# this automatically when the iPhone is on the same Wi-Fi as AltServer).
+#
+# How to use:
+# 1. Push this ios-app/ folder to a Git repository (GitHub).
+# 2. In Codemagic, add the repository, choose the iOS App workflow (or add
+#    this file as codemagic.yaml at the repo root).
+# 3. Run the workflow. Download the .ipa artifact.
+# 4. Send the .ipa to the iPhone and install it with AltStore (+).
+
+workflows:
+  ios-unsigned-ipa:
+    name: iOS unsigned IPA (AltStore)
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      cocoapods: default
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: '*'
+          include: true
+    scripts:
+      - name: Build unsigned archive
+        script: |
+          xcodebuild -project LivePhotoApp.xcodeproj \
+            -scheme LivePhotoApp \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/LivePhotoApp.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Export unsigned IPA from archive
+        script: |
+          # An unsigned archive has no signed .app to export with
+          # -exportArchive, so package the .app bundle as an .ipa directly.
+          # AltStore signs it on-device with the user's free Apple ID.
+          APP_PATH="build/LivePhotoApp.xcarchive/Products/Applications/LivePhotoApp.app"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r LivePhotoApp-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh LivePhotoApp-unsigned.ipa
+    artifacts:
+      - LivePhotoApp-unsigned.ipa
