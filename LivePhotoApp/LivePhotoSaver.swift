@@ -48,11 +48,12 @@ enum SaverError: LocalizedError {
 /// so Photos can pair the still and the clip into one Live Photo asset.
 struct LivePhotoSaver {
 
-    /// Request full Photo Library access. Live Photo creation (a photo
-    /// paired with a video) needs read-write access, not add-only: with
-    /// add-only, Photos could not complete the paired save (error 3300).
+    /// Request add-only Photo Library access. This app only adds Live
+    /// Photos to the library, so add-only is the correct level; asking
+    /// for full read-write access made Photos reject the paired save
+    /// (PHPhotosErrorDomain -1).
     static func requestAccess() async -> Bool {
-        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         return status == .authorized || status == .limited
     }
 
@@ -417,6 +418,11 @@ struct LivePhotoSaver {
     /// iTunes/keys format exiftool and iOS expect). The meta atom is a
     /// direct child of moov. If moov already has a meta, the identifier is
     /// merged into its keys/ilst instead.
+    /// Before injecting, any `udta` atom is removed from moov: the export
+    /// session writes one carrying its own `meta` (encoder info), leaving
+    /// two meta atoms in the file, which confuses Photos' video converter
+    /// (PHPhotosErrorDomain 3300). A real iPhone Live Photo .mov has only
+    /// the single moov-level meta.
     private static func injectMOVContentIdentifier(movURL: URL,
                                                    contentIdentifier: String) throws {
         var data: Data
@@ -425,8 +431,14 @@ struct LivePhotoSaver {
         } catch {
             throw SaverError.videoRemuxFailed
         }
-        guard let moov = findChildAtom(in: data, range: 0..<data.count, type: "moov") else {
+        guard var moov = findChildAtom(in: data, range: 0..<data.count, type: "moov") else {
             throw SaverError.videoRemuxFailed
+        }
+        // Remove any udta atom inside moov (and shrink moov accordingly).
+        if let udta = findChildAtom(in: data, range: (moov.offset + 8)..<(moov.offset + moov.size), type: "udta") {
+            data.removeSubrange(udta.offset..<(udta.offset + udta.size))
+            setBE32(&data, at: moov.offset, value: UInt32(moov.size - udta.size))
+            moov = (moov.offset, moov.size - udta.size)
         }
         let moovOff = moov.offset
         let moovSize = moov.size
