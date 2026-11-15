@@ -106,12 +106,49 @@ final class LivePhotoViewModel: ObservableObject {
         guard !items.isEmpty else { return }
         await saveAll()
     }
+
+    /// Build a .livp file for one item and return its temp file URL.
+    /// The .livp is iOS's own Live Photo container; opening it in Files
+    /// imports it as a real Live Photo. Used when the direct Photos save
+    /// keeps failing.
+    func exportLivp(item: LivePhotoItem) async -> URL? {
+        do {
+            let data = try await LivePhotoSaver.makeLivpData(item: item)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("IMG_\(item.id).livp")
+            try data.write(to: url, options: [.atomic])
+            return url
+        } catch {
+            status = "第 \(item.id) 张导出失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            return nil
+        }
+    }
+
+    /// Build .livp files for every item and return their temp file URLs.
+    func exportAllLivps() async -> [URL] {
+        var urls: [URL] = []
+        for item in items {
+            if let url = await exportLivp(item: item) {
+                urls.append(url)
+            }
+        }
+        if urls.isEmpty {
+            status = "导出失败，请重试"
+        } else {
+            status = "已导出 \(urls.count) 个实况文件，点分享存到“文件”里打开即可导入相册"
+        }
+        return urls
+    }
 }
 
 // MARK: - View
 
 struct ContentView: View {
     @StateObject private var viewModel = LivePhotoViewModel()
+    @FocusState private var linkFieldFocused: Bool
+    @State private var shareURLs: [URL] = []
+    @State private var showingShare = false
+    @State private var isExporting = false
 
     var body: some View {
         NavigationView {
@@ -123,6 +160,7 @@ struct ContentView: View {
                         .disableAutocorrection(true)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
+                        .focused($linkFieldFocused)
                     Button("粘贴") {
                         viewModel.pasteFromClipboard()
                     }
@@ -136,6 +174,7 @@ struct ContentView: View {
                 // Parse + one-tap download
                 HStack(spacing: 8) {
                     Button(action: {
+                        linkFieldFocused = false
                         Task { await viewModel.parse() }
                     }) {
                         HStack {
@@ -152,6 +191,7 @@ struct ContentView: View {
                     .disabled(viewModel.isParsing || viewModel.isSavingAll || viewModel.linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     Button(action: {
+                        linkFieldFocused = false
                         Task { await viewModel.downloadAll() }
                     }) {
                         HStack {
@@ -175,9 +215,10 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
-                // Save all
+                // Save all + export all as .livp files
                 if !viewModel.items.isEmpty {
                     Button(action: {
+                        linkFieldFocused = false
                         Task { await viewModel.saveAll() }
                     }) {
                         Text(viewModel.isSavingAll ? "正在保存…" : "全部保存（\(viewModel.items.count) 张）")
@@ -185,7 +226,29 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(viewModel.isSavingAll)
+                    .disabled(viewModel.isSavingAll || isExporting)
+
+                    Button(action: {
+                        linkFieldFocused = false
+                        Task {
+                            isExporting = true
+                            let urls = await viewModel.exportAllLivps()
+                            isExporting = false
+                            if !urls.isEmpty {
+                                shareURLs = urls
+                                showingShare = true
+                            }
+                        }
+                    }) {
+                        Text(isExporting ? "正在导出…" : "导出全部实况文件（\(viewModel.items.count) 个 .livp）")
+                            .fontWeight(.semibold)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isSavingAll || isExporting)
+                    Text("直接保存失败时用导出：把 .livp 存到“文件”，在“文件”里打开就能导入相册成为实况照片。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 // Live Photo list
@@ -196,6 +259,14 @@ struct ContentView: View {
                         isSaving: viewModel.savingIDs.contains(item.id),
                         onSave: {
                             Task { await viewModel.save(item: item) }
+                        },
+                        onExport: {
+                            Task {
+                                if let url = await viewModel.exportLivp(item: item) {
+                                    shareURLs = [url]
+                                    showingShare = true
+                                }
+                            }
                         }
                     )
                 }
@@ -204,8 +275,31 @@ struct ContentView: View {
             .padding()
             .navigationTitle("实况下载")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("完成") {
+                        linkFieldFocused = false
+                    }
+                }
+            }
+            .sheet(isPresented: $showingShare) {
+                ShareSheet(activityItems: shareURLs)
+            }
         }
     }
+}
+
+// MARK: - Share sheet (UIActivityViewController for iOS 15)
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Row
@@ -215,6 +309,7 @@ struct LivePhotoRow: View {
     let isSaved: Bool
     let isSaving: Bool
     let onSave: () -> Void
+    let onExport: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -251,20 +346,30 @@ struct LivePhotoRow: View {
 
             Spacer()
 
-            Button(action: onSave) {
-                if isSaving {
-                    ProgressView()
-                } else if isSaved {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                } else {
-                    Text("保存到相册")
-                        .font(.subheadline)
+            VStack(spacing: 6) {
+                Button(action: onSave) {
+                    if isSaving {
+                        ProgressView()
+                    } else if isSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    } else {
+                        Text("保存到相册")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isSaved || isSaving)
+
+                Button(action: onExport) {
+                    Text("导出实况文件")
+                        .font(.caption)
                         .fontWeight(.semibold)
                 }
+                .buttonStyle(.bordered)
+                .disabled(isSaving)
             }
-            .buttonStyle(.bordered)
-            .disabled(isSaved || isSaving)
         }
         .padding(.vertical, 4)
     }
