@@ -39,11 +39,13 @@ enum SaverError: LocalizedError {
 ///
 /// The still is a WebP image: decode it with UIImage and write it out as
 /// JPEG, then inject the EXIF MakerNote at the byte level. The motion clip
-/// is an h264 mp4: transcode it to a proper QuickTime .mov (full re-encode),
-/// then inject the QuickTime content identifier at the byte level. Both
-/// identifiers are written byte by byte (not via the system metadata APIs,
-/// which do not reliably persist them), so Photos can pair the still and
-/// the clip into one Live Photo asset.
+/// is an h264 mp4 with NO audio track: it is combined with a generated
+/// silent audio track (a real iPhone Live Photo always carries audio, and
+/// Photos fails to convert an audio-less clip, PHPhotosErrorDomain 3300)
+/// into a proper QuickTime .mov, then the QuickTime content identifier is
+/// injected at the byte level. Both identifiers are written byte by byte
+/// (not via the system metadata APIs, which do not reliably persist them),
+/// so Photos can pair the still and the clip into one Live Photo asset.
 struct LivePhotoSaver {
 
     /// Request add-only Photo Library access. Returns true if granted.
@@ -333,21 +335,49 @@ struct LivePhotoSaver {
         return seg
     }
 
-    /// Remux the mp4 clip to a proper QuickTime .mov (passthrough: the
-    /// video stream is copied without re-encoding, so the original frame
-    /// rate and timing are preserved exactly), then inject the content
-    /// identifier into it at the byte level. Passthrough is used because
-    /// a full re-encode changed the video's frame-rate characteristics
-    /// (max 120 fps) and Photos rejected the result (error 3300); the
-    /// identifier is written by byte injection, not by the export session,
-    /// so passthrough no longer loses it. This mirrors the reference app
-    /// (红薯秀), which transcodes only when it must; here the source clip
-    /// is already a valid h264 stream, so a clean remux is the safer path.
+    /// Build the .mov for a Live Photo: the motion clip plus a silent
+    /// audio track. The clip from Xiaohongshu has NO audio track at all,
+    /// and Photos rejects such a video when it tries to convert it for
+    /// the library (PHPhotosErrorDomain 3300 = videoConversionFailed).
+    /// A real iPhone Live Photo always carries audio, so a silent audio
+    /// track is added here (generated with AVAudioFile, ~2s of silence).
+    /// The video stream itself is copied without re-encoding, so the
+    /// original frame rate and timing are preserved exactly. The content
+    /// identifier is then injected at the byte level.
     private static func transcodeAndTagVideo(inputURL: URL, outputURL: URL,
                                              contentIdentifier: String) async throws {
         let asset = AVURLAsset(url: inputURL)
+        let duration = asset.duration
+        guard duration.seconds > 0 else { throw SaverError.videoRemuxFailed }
+        let tempDir = FileManager.default.temporaryDirectory
+        let audioURL = tempDir.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        try makeSilentAudioFile(duration: duration.seconds, outputURL: audioURL)
+
+        let comp = AVMutableComposition()
+        guard let videoTrack = comp.addMutableTrack(withMediaType: .video,
+                                                    preferredTrackID: kCMPersistentTrackID_Invalid),
+              let audioTrack = comp.addMutableTrack(withMediaType: .audio,
+                                                    preferredTrackID: kCMPersistentTrackID_Invalid),
+              let srcVideo = asset.tracks(withMediaType: .video).first else {
+            throw SaverError.videoRemuxFailed
+        }
+        let audioAsset = AVURLAsset(url: audioURL)
+        guard let srcAudio = audioAsset.tracks(withMediaType: .audio).first else {
+            throw SaverError.videoRemuxFailed
+        }
+        do {
+            try videoTrack.insertTimeRange(
+                CMTimeRange(start: .zero, duration: duration),
+                of: srcVideo, at: .zero)
+            try audioTrack.insertTimeRange(
+                CMTimeRange(start: .zero, duration: duration),
+                of: srcAudio, at: .zero)
+        } catch {
+            throw SaverError.videoRemuxFailed
+        }
         guard let exportSession = AVAssetExportSession(
-            asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            asset: comp, presetName: AVAssetExportPresetHighestQuality) else {
             throw SaverError.videoRemuxFailed
         }
         exportSession.outputURL = outputURL
@@ -358,6 +388,29 @@ struct LivePhotoSaver {
         }
         try injectMOVContentIdentifier(movURL: outputURL,
                                        contentIdentifier: contentIdentifier)
+    }
+
+    /// Write `duration` seconds of silence (mono, 44.1 kHz) to a WAV file.
+    /// AVAudioPCMBuffer is zero-filled, so the buffer is silence by default.
+    private static func makeSilentAudioFile(duration: TimeInterval,
+                                            outputURL: URL) throws {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44100,
+                                         channels: 1) else {
+            throw SaverError.videoRemuxFailed
+        }
+        let frameCount = AVAudioFrameCount((duration * 44100).rounded(.up))
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: frameCount) else {
+            throw SaverError.videoRemuxFailed
+        }
+        buffer.frameLength = frameCount
+        do {
+            let file = try AVAudioFile(forWriting: outputURL,
+                                       settings: format.settings)
+            try file.write(from: buffer)
+        } catch {
+            throw SaverError.videoRemuxFailed
+        }
     }
 
     /// Insert the content identifier as moov > meta > keys + ilst (the
