@@ -259,6 +259,9 @@ struct LivePhotoSaver {
             throw SaverError.jpegEncodeFailed
         }
         // Strip any existing APP1/Exif segment, keep everything else.
+        // Stop at SOS (0xDA): after it comes compressed scan data, which
+        // can contain 0xFF bytes that are not segment markers, so the rest
+        // of the file (SOS header + scan + EOI) is copied verbatim.
         var body = Data()
         var pos = 2
         while pos < data.count {
@@ -267,7 +270,8 @@ struct LivePhotoSaver {
                 break
             }
             let marker = data[pos + 1]
-            if marker == 0xD8 || marker == 0xD9 || (0xD0...0xD7).contains(marker) {
+            if marker == 0xD8 || marker == 0xD9 || marker == 0xDA
+                || (0xD0...0xD7).contains(marker) {
                 body.append(data[pos...])
                 break
             }
@@ -329,18 +333,21 @@ struct LivePhotoSaver {
         return seg
     }
 
-    /// Transcode the mp4 clip to a proper QuickTime .mov (full re-encode,
-    /// not passthrough), then inject the content identifier into it at the
-    /// byte level. Byte-level injection is used because AVAssetExportSession
-    /// metadata is not reliably written into the file, which left Photos
-    /// unable to pair the clip with the still (PHPhotosErrorDomain -1).
-    /// The injected meta atom is byte-identical in structure to an
-    /// exiftool-written .livp .mov (moov > meta > keys + ilst).
+    /// Remux the mp4 clip to a proper QuickTime .mov (passthrough: the
+    /// video stream is copied without re-encoding, so the original frame
+    /// rate and timing are preserved exactly), then inject the content
+    /// identifier into it at the byte level. Passthrough is used because
+    /// a full re-encode changed the video's frame-rate characteristics
+    /// (max 120 fps) and Photos rejected the result (error 3300); the
+    /// identifier is written by byte injection, not by the export session,
+    /// so passthrough no longer loses it. This mirrors the reference app
+    /// (红薯秀), which transcodes only when it must; here the source clip
+    /// is already a valid h264 stream, so a clean remux is the safer path.
     private static func transcodeAndTagVideo(inputURL: URL, outputURL: URL,
                                              contentIdentifier: String) async throws {
         let asset = AVURLAsset(url: inputURL)
         guard let exportSession = AVAssetExportSession(
-            asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+            asset: asset, presetName: AVAssetExportPresetPassthrough) else {
             throw SaverError.videoRemuxFailed
         }
         exportSession.outputURL = outputURL
