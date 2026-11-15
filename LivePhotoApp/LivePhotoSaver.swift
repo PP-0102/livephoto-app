@@ -39,13 +39,17 @@ enum SaverError: LocalizedError {
 ///
 /// The still is a WebP image: decode it with UIImage and write it out as
 /// JPEG, then inject the EXIF MakerNote at the byte level. The motion clip
-/// is an h264 mp4 with NO audio track: it is combined with a generated
-/// silent audio track (a real iPhone Live Photo always carries audio, and
-/// Photos fails to convert an audio-less clip, PHPhotosErrorDomain 3300)
-/// into a proper QuickTime .mov, then the QuickTime content identifier is
-/// injected at the byte level. Both identifiers are written byte by byte
-/// (not via the system metadata APIs, which do not reliably persist them),
-/// so Photos can pair the still and the clip into one Live Photo asset.
+/// is an h264 mp4. It is RE-ENCODED with AVAssetWriter using the same
+/// conservative parameters 红薯秀's FFmpeg pipeline uses (h264, Main
+/// profile level 3.1, yuv420p, explicit 30 fps target): AVAssetExportSession
+/// output was rejected by Photos' video converter (PHPhotosErrorDomain
+/// 3300 = videoConversionFailed), while a clean libx264-style re-encode
+/// is accepted. No audio track is added: 红薯秀's transcode has none
+/// either, and its saves work, so a missing audio track is not the cause
+/// of 3300. The content identifier is then injected at the byte level.
+/// Both identifiers are written byte by byte (not via the system metadata
+/// APIs, which do not reliably persist them), so Photos can pair the still
+/// and the clip into one Live Photo asset.
 struct LivePhotoSaver {
 
     /// Request add-only Photo Library access. This app only adds Live
@@ -336,82 +340,109 @@ struct LivePhotoSaver {
         return seg
     }
 
-    /// Build the .mov for a Live Photo: the motion clip plus a silent
-    /// audio track. The clip from Xiaohongshu has NO audio track at all,
-    /// and Photos rejects such a video when it tries to convert it for
-    /// the library (PHPhotosErrorDomain 3300 = videoConversionFailed).
-    /// A real iPhone Live Photo always carries audio, so a silent audio
-    /// track is added here (generated with AVAudioFile, ~2s of silence).
-    /// The video stream itself is copied without re-encoding, so the
-    /// original frame rate and timing are preserved exactly. The content
-    /// identifier is then injected at the byte level.
+    /// Build the .mov for a Live Photo by RE-ENCODING the motion clip with
+    /// AVAssetWriter, using the same conservative parameters 红薯秀's
+    /// FFmpeg pipeline uses: h264, Main profile level 3.1, yuv420p pixel
+    /// format, explicit 30 fps target, no audio track. AVAssetExportSession
+    /// output (HighestQuality re-encode or Passthrough) was rejected by
+    /// Photos' video converter (PHPhotosErrorDomain 3300 =
+    /// videoConversionFailed); a clean re-encode with these parameters is
+    /// what the working reference app produces. The content identifier is
+    /// then injected at the byte level.
     private static func transcodeAndTagVideo(inputURL: URL, outputURL: URL,
                                              contentIdentifier: String) async throws {
         let asset = AVURLAsset(url: inputURL)
-        let duration = asset.duration
-        guard duration.seconds > 0 else { throw SaverError.videoRemuxFailed }
-        let tempDir = FileManager.default.temporaryDirectory
-        let audioURL = tempDir.appendingPathComponent(UUID().uuidString + ".wav")
-        defer { try? FileManager.default.removeItem(at: audioURL) }
-        try makeSilentAudioFile(duration: duration.seconds, outputURL: audioURL)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            throw SaverError.videoRemuxFailed
+        }
+        // h264 needs even dimensions; round down if the source is odd.
+        let naturalSize = videoTrack.naturalSize
+        let width = (Int(naturalSize.width) / 2) * 2
+        let height = (Int(naturalSize.height) / 2) * 2
+        guard width > 0, height > 0 else { throw SaverError.videoRemuxFailed }
 
-        let comp = AVMutableComposition()
-        guard let videoTrack = comp.addMutableTrack(withMediaType: .video,
-                                                    preferredTrackID: kCMPersistentTrackID_Invalid),
-              let audioTrack = comp.addMutableTrack(withMediaType: .audio,
-                                                    preferredTrackID: kCMPersistentTrackID_Invalid),
-              let srcVideo = asset.tracks(withMediaType: .video).first else {
-            throw SaverError.videoRemuxFailed
-        }
-        let audioAsset = AVURLAsset(url: audioURL)
-        guard let srcAudio = audioAsset.tracks(withMediaType: .audio).first else {
-            throw SaverError.videoRemuxFailed
-        }
+        // Reader: decode the source to yuv420p pixel buffers.
+        let reader: AVAssetReader
         do {
-            try videoTrack.insertTimeRange(
-                CMTimeRange(start: .zero, duration: duration),
-                of: srcVideo, at: .zero)
-            try audioTrack.insertTimeRange(
-                CMTimeRange(start: .zero, duration: duration),
-                of: srcAudio, at: .zero)
+            reader = try AVAssetReader(asset: asset)
         } catch {
             throw SaverError.videoRemuxFailed
         }
-        guard let exportSession = AVAssetExportSession(
-            asset: comp, presetName: AVAssetExportPresetHighestQuality) else {
+        let readerOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ])
+        reader.add(readerOutput)
+
+        // Writer: h264, Main profile level 3.1, yuv420p, 30 fps target.
+        let writer: AVAssetWriter
+        do {
+            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        } catch {
             throw SaverError.videoRemuxFailed
         }
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = .mov
-        await exportSession.export()
-        guard exportSession.status == .completed else {
-            throw exportSession.error ?? SaverError.videoRemuxFailed
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264Main31,
+                AVVideoAverageBitRateKey: 8_000_000,
+                AVVideoExpectedSourceFrameRateKey: 30,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+            ]
+        ]
+        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        writerInput.expectsMediaDataInRealTime = false
+        writerInput.transform = videoTrack.preferredTransform
+        writer.add(writerInput)
+
+        writer.startWriting()
+        reader.startReading()
+        writer.startSession(atSourceTime: .zero)
+
+        // Copy frames from the reader to the writer until the clip ends.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let queue = DispatchQueue(label: "livephoto.writer")
+            var finished = false
+            writerInput.requestMediaDataWhenReady(on: queue) {
+                guard !finished else { return }
+                while writerInput.isReadyForMoreMediaData {
+                    if let sample = readerOutput.copyNextSampleBuffer() {
+                        if !writerInput.append(sample) {
+                            finished = true
+                            writer.cancelWriting()
+                            continuation.resume(throwing: writer.error ?? SaverError.videoRemuxFailed)
+                            return
+                        }
+                    } else {
+                        // No more samples: end of clip, or the reader failed.
+                        finished = true
+                        if reader.status == .failed {
+                            writer.cancelWriting()
+                            continuation.resume(throwing: reader.error ?? SaverError.videoRemuxFailed)
+                            return
+                        }
+                        writerInput.markAsFinished()
+                        writer.finishWriting {
+                            if writer.status == .completed {
+                                continuation.resume()
+                            } else {
+                                continuation.resume(throwing: writer.error ?? SaverError.videoRemuxFailed)
+                            }
+                        }
+                        return
+                    }
+                }
+                if reader.status == .failed {
+                    finished = true
+                    writer.cancelWriting()
+                    continuation.resume(throwing: reader.error ?? SaverError.videoRemuxFailed)
+                }
+            }
         }
         try injectMOVContentIdentifier(movURL: outputURL,
                                        contentIdentifier: contentIdentifier)
-    }
-
-    /// Write `duration` seconds of silence (mono, 44.1 kHz) to a WAV file.
-    /// AVAudioPCMBuffer is zero-filled, so the buffer is silence by default.
-    private static func makeSilentAudioFile(duration: TimeInterval,
-                                            outputURL: URL) throws {
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44100,
-                                         channels: 1) else {
-            throw SaverError.videoRemuxFailed
-        }
-        let frameCount = AVAudioFrameCount((duration * 44100).rounded(.up))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                            frameCapacity: frameCount) else {
-            throw SaverError.videoRemuxFailed
-        }
-        buffer.frameLength = frameCount
-        do {
-            let file = try AVAudioFile(forWriting: outputURL,
-                                       settings: format.settings)
-            try file.write(from: buffer)
-        } catch {
-            throw SaverError.videoRemuxFailed
-        }
     }
 
     /// Insert the content identifier as moov > meta > keys + ilst (the
