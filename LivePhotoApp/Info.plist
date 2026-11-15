@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>实况下载</string>
+	<string>图片下载</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -23,9 +23,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>本 App 需要将下载的实况照片保存到你的相册，以便你在相册里长按播放。</string>
+	<string>本 App 需要将下载的图片保存到你的相册。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>本 App 需要访问你的相册，以便将下载的实况照片保存到相册里。</string>
+	<string>本 App 需要访问你的相册，以便将下载的图片保存到相册里。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>
