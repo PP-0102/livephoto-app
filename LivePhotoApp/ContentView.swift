@@ -17,10 +17,12 @@ final class ImageViewModel: ObservableObject {
     @Published var isVideoSaving = false
 
     /// Parse the pasted link and list the images (and video) in the note.
+    /// Douyin links go to the Douyin resolver; everything else goes to
+    /// the Xiaohongshu resolver.
     func parse() async {
         let link = linkText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !link.isEmpty else {
-            status = "请先粘贴小红书笔记链接"
+            status = "请先粘贴小红书或抖音笔记链接"
             return
         }
         isParsing = true
@@ -30,7 +32,11 @@ final class ImageViewModel: ObservableObject {
         isVideoSaved = false
         status = "正在解析…"
         do {
-            let media = try await ImageResolver.resolve(link: link)
+            let lower = link.lowercased()
+            let isDouyin = lower.contains("douyin.com") || lower.contains("v.douyin.com")
+            let media = isDouyin
+                ? try await DouyinResolver.resolve(link: link)
+                : try await ImageResolver.resolve(link: link)
             items = media.images
             video = media.video
             if media.video != nil {
@@ -156,7 +162,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 12) {
                 // Link input
                 HStack(spacing: 8) {
-                    TextField("粘贴小红书笔记链接", text: $viewModel.linkText)
+                    TextField("粘贴小红书或抖音笔记链接", text: $viewModel.linkText)
                         .textFieldStyle(.roundedBorder)
                         .disableAutocorrection(true)
                         .keyboardType(.URL)
