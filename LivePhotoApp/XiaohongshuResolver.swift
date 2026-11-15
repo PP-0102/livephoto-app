@@ -61,8 +61,13 @@ struct XiaohongshuResolver {
     }
 
     /// Fetch the note page HTML for a pasted explore link.
+    ///
+    /// The pasted text may contain more than the link itself (Xiaohongshu
+    /// share text often has a title in front of the URL), so the first
+    /// http(s) URL inside the text is extracted instead of requiring the
+    /// whole string to be a URL.
     static func fetchNoteHTML(link: String) async throws -> String {
-        guard let url = URL(string: link.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        guard let url = extractLinkURL(from: link) else {
             throw ResolverError.invalidURL
         }
         var request = URLRequest(url: url)
@@ -149,6 +154,27 @@ struct XiaohongshuResolver {
     }
 
     // MARK: - Helpers
+
+    /// Find the first http(s) URL inside pasted text and return it as a URL.
+    /// Share text often has a title in front of the link, and may append
+    /// punctuation after it, so the URL is taken up to the first whitespace
+    /// and trailing punctuation is trimmed. Returns nil when no URL is found.
+    static func extractLinkURL(from text: String) -> URL? {
+        guard let range = text.range(of: "https?://", options: .regularExpression) else {
+            return nil
+        }
+        var urlString = String(text[range.lowerBound...])
+        if let ws = urlString.firstIndex(where: { $0.isWhitespace }) {
+            urlString = String(urlString[..<ws])
+        }
+        // Trim punctuation that share text often appends after the link.
+        while let last = urlString.last,
+              ".,;:!?。！？；：、）)】]}」”\"'".contains(last) {
+            urlString.removeLast()
+        }
+        guard !urlString.isEmpty else { return nil }
+        return URL(string: urlString)
+    }
 
     /// The note page's still/video CDN URLs are http://. Upgrade to https://
     /// so App Transport Security never blocks them.

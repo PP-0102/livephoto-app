@@ -85,6 +85,26 @@ final class LivePhotoViewModel: ObservableObject {
             linkText = text
         }
     }
+
+    /// Clear the link field and the parsed results.
+    func clear() {
+        linkText = ""
+        items = []
+        status = ""
+        savedIDs = []
+        savingIDs = []
+    }
+
+    /// One-tap download: parse the link (if not parsed yet) and save every
+    /// Live Photo to the Photos library.
+    func downloadAll() async {
+        guard !isParsing, !isSavingAll else { return }
+        if items.isEmpty {
+            await parse()
+        }
+        guard !items.isEmpty else { return }
+        await saveAll()
+    }
 }
 
 // MARK: - View
@@ -106,24 +126,46 @@ struct ContentView: View {
                         viewModel.pasteFromClipboard()
                     }
                     .buttonStyle(.bordered)
+                    Button("一键清空") {
+                        viewModel.clear()
+                    }
+                    .buttonStyle(.bordered)
                 }
 
-                // Parse button
-                Button(action: {
-                    Task { await viewModel.parse() }
-                }) {
-                    HStack {
-                        if viewModel.isParsing {
-                            ProgressView()
-                                .progressViewStyle(.circular)
+                // Parse + one-tap download
+                HStack(spacing: 8) {
+                    Button(action: {
+                        Task { await viewModel.parse() }
+                    }) {
+                        HStack {
+                            if viewModel.isParsing {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                            }
+                            Text(viewModel.isParsing ? "正在解析…" : "解析")
+                                .fontWeight(.semibold)
                         }
-                        Text(viewModel.isParsing ? "正在解析…" : "解析")
-                            .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isParsing || viewModel.isSavingAll || viewModel.linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button(action: {
+                        Task { await viewModel.downloadAll() }
+                    }) {
+                        HStack {
+                            if viewModel.isSavingAll {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                            }
+                            Text(viewModel.isSavingAll ? "正在下载…" : "一键下载")
+                                .fontWeight(.semibold)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(viewModel.isParsing || viewModel.isSavingAll || viewModel.linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isParsing || viewModel.linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 // Status line
                 if !viewModel.status.isEmpty {
