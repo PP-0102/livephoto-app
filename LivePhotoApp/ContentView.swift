@@ -93,7 +93,7 @@ struct ContentView: View {
     @StateObject private var viewModel = LivePhotoViewModel()
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             VStack(alignment: .leading, spacing: 12) {
                 // Link input
                 HStack(spacing: 8) {
