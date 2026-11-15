@@ -76,11 +76,9 @@ struct LivePhotoSaver {
         let mp4URL = tempDir.appendingPathComponent(base + ".mp4")
         let movURL = tempDir.appendingPathComponent(base + ".mov")
         defer {
-            // Only the source mp4 is removed here. The jpg/mov are handed
-            // to Photos by file URL and the daemon may still read them
-            // after the save call returns (video conversion runs async),
-            // so they are left for the system's temp-directory purge.
+            try? FileManager.default.removeItem(at: jpgURL)
             try? FileManager.default.removeItem(at: mp4URL)
+            try? FileManager.default.removeItem(at: movURL)
         }
         do {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
@@ -94,9 +92,8 @@ struct LivePhotoSaver {
             throw SaverError.saveFailed
         }
 
-        // 5. Save as one Live Photo asset (.photo + .pairedVideo) from the
-        // prepared files. The temp files stay alive until performSave
-        // returns (defer runs after), so the Photos daemon can read them.
+        // 5. Save as one Live Photo asset (.photo + .pairedVideo), passing
+        // the file contents as Data so Photos can read the identifiers.
         try await performSave(jpgURL: jpgURL, movURL: movURL)
     }
 
@@ -689,18 +686,26 @@ struct LivePhotoSaver {
         }
     }
 
-    /// One creation request with both resources, passed as file URLs.
-    /// File URLs are used (not in-memory Data) because the Photos daemon
-    /// and its video converter read the paired video from disk by path;
-    /// passing the video as Data left the converter unable to process it
-    /// (PHPhotosErrorDomain 3300). This matches the reference app
-    /// (红薯秀), whose native converter also hands Photos file URLs.
+    /// One creation request with both resources, passed as Data.
+    /// Data is used (not file URLs) because with file URLs Photos could
+    /// not validate the shared content identifier (PHPhotosErrorDomain
+    /// -1); passing the bytes as Data lets Photos read the identifiers
+    /// and pair the still with the clip. The temp files are read here
+    /// and can be removed by the caller afterwards.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
+        let jpgData: Data
+        let movData: Data
+        do {
+            jpgData = try Data(contentsOf: jpgURL)
+            movData = try Data(contentsOf: movURL)
+        } catch {
+            throw SaverError.saveFailed
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, fileURL: jpgURL, options: nil)
-                request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
+                request.addResource(with: .photo, data: jpgData, options: nil)
+                request.addResource(with: .pairedVideo, data: movData, options: nil)
             }, completionHandler: { success, error in
                 if let error = error {
                     continuation.resume(throwing: error)
