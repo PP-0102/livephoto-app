@@ -20,7 +20,7 @@ no Shortcut — a real app installed on the iPhone.
 
 - **Bundle ID:** `com.hatoyo.livephoto`
 - **Display name:** 实况下载
-- **Deployment target:** iOS 16.0, iPhone portrait only
+- **Deployment target:** iOS 15.0, iPhone portrait only
 - **Language:** Swift 5, SwiftUI. Frameworks used: SwiftUI, Photos, Foundation, UIKit.
 - **App icon:** a placeholder icon (coral gradient + Live Photo rings) is
   included in `Assets.xcassets/AppIcon.appiconset`. Replace it with a final
@@ -69,7 +69,7 @@ installed with AltStore.
 2. In Codemagic, add the repository and choose the **iOS App** workflow
    (or create a custom workflow from `codemagic.yaml` if one is added).
 3. Xcode version: use a recent stable one (e.g. **Xcode 15.x or 16.x**).
-   The project targets iOS 16.0 and Swift 5, so any Xcode 15+ works.
+   The project targets iOS 15.0 and Swift 5, so any Xcode 15+ works.
 4. Build settings for an unsigned build:
    - Build command (or Codemagic "Xcode build" step):
      `xcodebuild -project LivePhotoApp.xcodeproj -scheme LivePhotoApp -configuration Release -destination "generic/platform=iOS" -archivePath build/LivePhotoApp.xcarchive archive CODE_SIGNING_ALLOWED=NO`
