@@ -43,30 +43,34 @@ enum LivePhotoError: LocalizedError {
 /// Live Photo (.photo + .pairedVideo sharing one content identifier).
 ///
 /// History: the standalone 实况下载 app (v1–v14) never got a save to work
-/// (errors -1 and 3300). The first build inside this app used the
-/// glitter-live recipe (HEVC + writer.metadata + live-photo-info /
-/// still-image-time tracks) and STILL failed with 3300 on all 7 photos
-/// of the test note (2026-11-16). What changed for this build:
-///  1. The content identifier is still written with the official API —
-///     `AVAssetWriter.metadata` with a `.quickTimeMetadataContentIdentifier`
-///     item — not byte-injected.
+/// (errors -1 and 3300), and the first builds inside this app failed
+/// with 3300 too. What the current build does differently, and why:
+///  1. BOTH identifiers are written byte by byte (verified on the VM):
+///     the still's MakerNote lives in the Exif sub-IFD (IFD0 -> 0x8769
+///     -> Exif IFD -> 0x927C) with Make "Apple" — the earlier build put
+///     it directly in IFD0 with no Make tag, which Photos could not
+///     read at all; the clip's identifier is injected as a moov-level
+///     meta atom (iTunes/keys format, byte-identical in structure to
+///     an exiftool-written .livp .mov). The official `writer.metadata`
+///     API was used before and was never verified to land the
+///     identifier in the file, so it is no longer used.
 ///  2. NO timed-metadata tracks. The iOS 17 camera reference values the
 ///     tracks were built from are the prime suspect for 3300 on iOS 15.1:
 ///     Photos' video converter has to process every track, and plain
 ///     Photos only needs the shared identifier to pair still + video.
-///  3. H.264 first (the "Most Compatible" format), HEVC only as a
+///  3. H.264 High 4.1 (the "Most Compatible" format), HEVC only as a
 ///     fallback if H.264 encoding fails on the device. The H.264
 ///     profile/level MUST fit the frame: the source clip is 1080x1440
-///     High 5.0, and Main 3.1 (used in the previous build) caps at
+///     High 5.0, and Main 3.1 (used in an earlier build) caps at
 ///     3600 macroblocks — a 1080x1440 frame is 6075, so that re-encode
 ///     was non-conformant and Photos' converter rejected it with 3300
 ///     (confirmed on the VM: libx264 reports "frame MB size (68x90) >
 ///     level limit (3600)"). High 4.1 is used instead.
 ///  4. The save passes both files as Data. File URLs were tried in
 ///     every build and always failed with -1, so they are not attempted.
-///  5. The still's MakerNote is written byte by byte (binary plist
-///     {17: <uuid>}) — verified on the VM to parse back correctly, and
-///     verified on a real file the old app exported.
+///  5. makeLivpData() exports the exact same pair as a .livp file, so
+///     the bytes the app produces can be inspected when the direct
+///     save still fails.
 struct LivePhotoSaver {
 
     /// Request add-only Photo Library access. This app only adds photos
@@ -78,9 +82,111 @@ struct LivePhotoSaver {
     }
 
     /// Save one Live Photo item to the Photos library.
-    /// The still is downloaded at original quality first (falling back to
-    /// the 1080px web version); the motion clip is the note's mp4.
     static func saveLivePhoto(item: ImageItem) async throws {
+        let (jpgURL, movURL, mp4URL) = try await buildPairFiles(item: item)
+        defer {
+            try? FileManager.default.removeItem(at: jpgURL)
+            try? FileManager.default.removeItem(at: mp4URL)
+            try? FileManager.default.removeItem(at: movURL)
+        }
+        // Save as one Live Photo asset (.photo + .pairedVideo), passing
+        // the file contents as Data so Photos can read the identifiers.
+        // (File URLs made Photos reject the pair with error -1.)
+        try await performSave(jpgURL: jpgURL, movURL: movURL)
+    }
+
+    /// Build a .livp file (ZIP of the tagged JPEG still + tagged MOV clip
+    /// sharing one content identifier) and return it as Data. A .livp is
+    /// the format iOS itself uses for Live Photos. This is the diagnostic
+    /// export: if the direct Photos save keeps failing, the user can send
+    /// this file back and its exact bytes can be inspected.
+    static func makeLivpData(item: ImageItem) async throws -> Data {
+        let (jpgURL, movURL, mp4URL) = try await buildPairFiles(item: item)
+        defer {
+            try? FileManager.default.removeItem(at: jpgURL)
+            try? FileManager.default.removeItem(at: mp4URL)
+            try? FileManager.default.removeItem(at: movURL)
+        }
+        let jpgData = try Data(contentsOf: jpgURL)
+        let movData = try Data(contentsOf: movURL)
+        let stem = "IMG_\(item.id)"
+        return zipStored(files: [(stem + ".JPG", jpgData), (stem + ".MOV", movData)])
+    }
+
+    /// Minimal ZIP writer (stored entries, no compression). Sufficient for
+    /// .livp, which iOS reads as a Live Photo container.
+    private static func zipStored(files: [(name: String, data: Data)]) -> Data {
+        var out = Data()
+        var central = Data()
+        for file in files {
+            let nameBytes = Array(file.name.utf8)
+            let crc = crc32(file.data)
+            let localOffset = UInt32(out.count)
+            // Local file header.
+            appendLE32(0x04034b50, to: &out)
+            appendLE16(20, to: &out)              // version needed
+            appendLE16(0x0800, to: &out)          // flags: UTF-8 filenames
+            appendLE16(0, to: &out)               // method: stored
+            appendLE16(0, to: &out)               // mod time
+            appendLE16(0x21, to: &out)            // mod date (1980-01-01)
+            appendLE32(crc, to: &out)
+            appendLE32(UInt32(file.data.count), to: &out)
+            appendLE32(UInt32(file.data.count), to: &out)
+            appendLE16(UInt16(nameBytes.count), to: &out)
+            appendLE16(0, to: &out)               // extra length
+            out.append(contentsOf: nameBytes)
+            out.append(file.data)
+            // Central directory entry.
+            appendLE32(0x02014b50, to: &central)
+            appendLE16(20, to: &central)          // version made by
+            appendLE16(20, to: &central)          // version needed
+            appendLE16(0x0800, to: &central)      // flags: UTF-8
+            appendLE16(0, to: &central)           // method: stored
+            appendLE16(0, to: &central)           // mod time
+            appendLE16(0x21, to: &central)        // mod date
+            appendLE32(crc, to: &central)
+            appendLE32(UInt32(file.data.count), to: &central)
+            appendLE32(UInt32(file.data.count), to: &central)
+            appendLE16(UInt16(nameBytes.count), to: &central)
+            appendLE16(0, to: &central)           // extra
+            appendLE16(0, to: &central)           // comment
+            appendLE16(0, to: &central)           // disk number
+            appendLE16(0, to: &central)           // internal attrs
+            appendLE32(0, to: &central)           // external attrs
+            appendLE32(localOffset, to: &central)
+            central.append(contentsOf: nameBytes)
+        }
+        let centralOffset = UInt32(out.count)
+        out.append(central)
+        // End of central directory.
+        appendLE32(0x06054b50, to: &out)
+        appendLE16(0, to: &out)                   // disk number
+        appendLE16(0, to: &out)                   // central dir disk
+        appendLE16(UInt16(files.count), to: &out)
+        appendLE16(UInt16(files.count), to: &out)
+        appendLE32(UInt32(central.count), to: &out)
+        appendLE32(centralOffset, to: &out)
+        appendLE16(0, to: &out)                   // comment length
+        return out
+    }
+
+    /// CRC-32 (IEEE, polynomial 0xEDB88320) for the ZIP entries.
+    private static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1)
+            }
+        }
+        return crc ^ 0xFFFFFFFF
+    }
+
+    /// Download the still + motion clip and write the tagged JPEG still
+    /// and the transcoded + tagged .mov. Returns the temp file URLs;
+    /// the caller removes them. Shared by saveLivePhoto and makeLivpData
+    /// so both work on exactly the same files.
+    private static func buildPairFiles(item: ImageItem) async throws -> (jpgURL: URL, movURL: URL, mp4URL: URL) {
         guard let clipURL = item.livePhotoClipURL else {
             throw LivePhotoError.notLivePhoto
         }
@@ -114,11 +220,6 @@ struct LivePhotoSaver {
         let base = UUID().uuidString
         let jpgURL = tempDir.appendingPathComponent(base + ".jpg")
         let movURL = tempDir.appendingPathComponent(base + ".mov")
-        defer {
-            try? FileManager.default.removeItem(at: jpgURL)
-            try? FileManager.default.removeItem(at: mp4URL)
-            try? FileManager.default.removeItem(at: movURL)
-        }
         do {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
                           contentIdentifier: contentIdentifier)
@@ -129,11 +230,7 @@ struct LivePhotoSaver {
         } catch {
             throw LivePhotoError.saveFailed
         }
-
-        // 5. Save as one Live Photo asset (.photo + .pairedVideo), passing
-        // the file contents as Data so Photos can read the identifiers.
-        // (File URLs made Photos reject the pair with error -1.)
-        try await performSave(jpgURL: jpgURL, movURL: movURL)
+        return (jpgURL, movURL, mp4URL)
     }
 
     // MARK: - Downloads
@@ -455,8 +552,13 @@ extension LivePhotoSaver {
         }
     }
 
-    /// Re-encode the clip with AVAssetWriter, writing the content
-    /// identifier through the official `writer.metadata` API.
+    /// Re-encode the clip with AVAssetWriter, then write the content
+    /// identifier into the .mov byte by byte (moov > meta, iTunes/keys
+    /// format — the same structure exiftool writes). The official
+    /// `writer.metadata` API was used in the previous builds and was
+    /// never verified to actually land the identifier in the file;
+    /// the byte-injected form was verified on the VM to read back
+    /// correctly with exiftool, so it is used instead.
     ///
     /// Deliberately NO timed-metadata tracks (live-photo-info /
     /// still-image-time): the previous build wrote them from iOS 17
@@ -499,7 +601,8 @@ extension LivePhotoSaver {
         } catch {
             throw LivePhotoError.videoEncodeFailed
         }
-        writer.metadata = [contentIdentifierItem(contentIdentifier)]
+        // NOTE: no writer.metadata here — the content identifier is
+        // injected byte by byte after the write (see below).
 
         let bt709: [String: Any] = [
             AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
@@ -567,15 +670,231 @@ extension LivePhotoSaver {
         guard writer.status == .completed else {
             throw LivePhotoError.videoEncodeFailed
         }
+        // Write the content identifier into the finished .mov, byte by
+        // byte, as a moov-level meta atom (see below).
+        try injectMOVContentIdentifier(movURL: outputURL,
+                                       contentIdentifier: contentIdentifier)
+    }
+}
+
+// MARK: - MOV content identifier (byte-level)
+//
+// The identifier is injected into the .mov as moov > meta > keys + ilst
+// (the iTunes/keys format exiftool and iOS expect), as a direct child of
+// moov. Ported from the standalone 实况下载 app (v6/v14), where this
+// exact byte layout was verified on the VM to read back with exiftool
+// and to be byte-identical in structure to an exiftool-written .livp .mov.
+
+extension LivePhotoSaver {
+
+    /// Insert the content identifier as moov > meta > keys + ilst.
+    /// If moov already has a meta, the identifier is merged into its
+    /// keys/ilst instead. Before injecting, any `udta` atom is removed
+    /// from moov: the writer leaves one carrying its own `meta`
+    /// (encoder info), leaving two meta atoms in the file, which
+    /// confuses Photos' video converter (PHPhotosErrorDomain 3300).
+    /// A real iPhone Live Photo .mov has only the single moov-level meta.
+    private static func injectMOVContentIdentifier(movURL: URL,
+                                                   contentIdentifier: String) throws {
+        var data: Data
+        do {
+            data = try Data(contentsOf: movURL)
+        } catch {
+            throw LivePhotoError.videoEncodeFailed
+        }
+        guard var moov = findChildAtom(in: data, range: 0..<data.count, type: "moov") else {
+            throw LivePhotoError.videoEncodeFailed
+        }
+        // Remove any udta atom inside moov (and shrink moov accordingly).
+        if let udta = findChildAtom(in: data, range: (moov.offset + 8)..<(moov.offset + moov.size), type: "udta") {
+            data.removeSubrange(udta.offset..<(udta.offset + udta.size))
+            setBE32(&data, at: moov.offset, value: UInt32(moov.size - udta.size))
+            moov = (moov.offset, moov.size - udta.size)
+        }
+        let moovOff = moov.offset
+        let moovSize = moov.size
+        let moovEnd = moovOff + moovSize
+        if let meta = findChildAtom(in: data, range: (moovOff + 8)..<moovEnd, type: "meta") {
+            try mergeMOVIdentifier(&data, moovOff: moovOff, moovSize: moovSize,
+                                   metaOff: meta.offset, metaSize: meta.size,
+                                   contentIdentifier: contentIdentifier)
+        } else {
+            let metaAtom = buildMetaAtom(contentIdentifier: contentIdentifier)
+            data.insert(contentsOf: metaAtom, at: moovEnd)
+            setBE32(&data, at: moovOff, value: UInt32(moovSize + metaAtom.count))
+        }
+        do {
+            try data.write(to: movURL, options: [.atomic])
+        } catch {
+            throw LivePhotoError.videoEncodeFailed
+        }
     }
 
-    /// The content identifier as an official QuickTime metadata item.
-    private static func contentIdentifierItem(_ identifier: String) -> AVMetadataItem {
-        let item = AVMutableMetadataItem()
-        item.identifier = .quickTimeMetadataContentIdentifier
-        item.dataType = kCMMetadataBaseDataType_UTF8 as String
-        item.value = identifier as NSString
+    /// Merge the identifier into an existing moov > meta atom.
+    private static func mergeMOVIdentifier(_ data: inout Data, moovOff: Int, moovSize: Int,
+                                           metaOff: Int, metaSize: Int,
+                                           contentIdentifier: String) throws {
+        let key = Array("com.apple.quicktime.content.identifier".utf8)
+        let metaEnd = metaOff + metaSize
+        // Resolve the 1-based key index for the content identifier.
+        var index: UInt32 = 1
+        var grownByKeys = 0
+        if let keys = findChildAtom(in: data, range: (metaOff + 8)..<metaEnd, type: "keys") {
+            let kOff = keys.offset
+            let kSize = keys.size
+            let kEnd = kOff + kSize
+            let count = readBE32(data, at: kOff + 12)
+            var p = kOff + 16
+            var found: UInt32?
+            for i in 0..<Int(count) {
+                guard p + 8 <= kEnd else { break }
+                let eSize = Int(readBE32(data, at: p))
+                guard eSize >= 8, p + eSize <= kEnd else { break }
+                let ns = Array(data[(p + 4)..<(p + 8)])
+                let kstr = Array(data[(p + 8)..<(p + eSize)])
+                if ns == Array("mdta".utf8) && kstr == key {
+                    found = UInt32(i + 1)
+                    break
+                }
+                p += eSize
+            }
+            if let found {
+                index = found
+            } else {
+                index = count + 1
+                var entry = Data()
+                appendBE32(UInt32(8 + key.count), to: &entry)
+                entry.append(contentsOf: Array("mdta".utf8))
+                entry.append(contentsOf: key)
+                data.insert(contentsOf: entry, at: kEnd)
+                grownByKeys = entry.count
+                setBE32(&data, at: kOff + 12, value: count + 1)
+                setBE32(&data, at: kOff, value: UInt32(kSize + grownByKeys))
+            }
+        } else {
+            // No keys atom: create one (our key as entry 1) after hdlr.
+            var entry = Data()
+            appendBE32(UInt32(8 + key.count), to: &entry)
+            entry.append(contentsOf: Array("mdta".utf8))
+            entry.append(contentsOf: key)
+            var keysAtom = Data()
+            appendBE32(UInt32(8 + 4 + 4 + entry.count), to: &keysAtom)
+            keysAtom.append(contentsOf: Array("keys".utf8))
+            appendBE32(0, to: &keysAtom)
+            appendBE32(1, to: &keysAtom)
+            keysAtom.append(entry)
+            var insertAt = metaOff + 8
+            if let hdlr = findChildAtom(in: data, range: (metaOff + 8)..<metaEnd, type: "hdlr") {
+                insertAt = hdlr.offset + hdlr.size
+            }
+            data.insert(contentsOf: keysAtom, at: insertAt)
+            grownByKeys = keysAtom.count
+        }
+        let item = buildIlstItem(contentIdentifier: contentIdentifier, index: index)
+        let newMetaEnd = metaEnd + grownByKeys
+        // Re-find ilst in the (possibly grown) data, so its offset is fresh.
+        if let ilst = findChildAtom(in: data, range: (metaOff + 8)..<newMetaEnd, type: "ilst") {
+            let iOff = ilst.offset
+            let iSize = ilst.size
+            let iEnd = iOff + iSize
+            data.insert(contentsOf: item, at: iEnd)
+            setBE32(&data, at: iOff, value: UInt32(iSize + item.count))
+            setBE32(&data, at: metaOff, value: UInt32(metaSize + grownByKeys + item.count))
+            setBE32(&data, at: moovOff, value: UInt32(moovSize + grownByKeys + item.count))
+        } else {
+            var ilstAtom = Data()
+            appendBE32(UInt32(8 + item.count), to: &ilstAtom)
+            ilstAtom.append(contentsOf: Array("ilst".utf8))
+            ilstAtom.append(item)
+            data.insert(contentsOf: ilstAtom, at: newMetaEnd)
+            let grown = grownByKeys + ilstAtom.count
+            setBE32(&data, at: metaOff, value: UInt32(metaSize + grown))
+            setBE32(&data, at: moovOff, value: UInt32(moovSize + grown))
+        }
+    }
+
+    /// meta atom in the iTunes/keys format (no version/flags word after the
+    /// header): hdlr(32) + keys(62) + ilst(68) for a 36-char UUID.
+    private static func buildMetaAtom(contentIdentifier: String) -> Data {
+        let key = Array("com.apple.quicktime.content.identifier".utf8)
+        // hdlr: 8 header + 4 ver/flags + 4 pre_defined + 4 "mdta" + 12 reserved.
+        var hdlr = Data()
+        appendBE32(32, to: &hdlr)
+        hdlr.append(contentsOf: Array("hdlr".utf8))
+        appendBE32(0, to: &hdlr)
+        appendBE32(0, to: &hdlr)
+        hdlr.append(contentsOf: Array("mdta".utf8))
+        hdlr.append(contentsOf: [UInt8](repeating: 0, count: 12))
+        // keys entry: size + "mdta" + key string.
+        var entry = Data()
+        appendBE32(UInt32(8 + key.count), to: &entry)
+        entry.append(contentsOf: Array("mdta".utf8))
+        entry.append(contentsOf: key)
+        var keys = Data()
+        appendBE32(UInt32(8 + 4 + 4 + entry.count), to: &keys)
+        keys.append(contentsOf: Array("keys".utf8))
+        appendBE32(0, to: &keys)
+        appendBE32(1, to: &keys)
+        keys.append(entry)
+        // ilst with one indexed item.
+        let item = buildIlstItem(contentIdentifier: contentIdentifier, index: 1)
+        var ilst = Data()
+        appendBE32(UInt32(8 + item.count), to: &ilst)
+        ilst.append(contentsOf: Array("ilst".utf8))
+        ilst.append(item)
+        // meta: no version/flags word (unlike most atoms).
+        var meta = Data()
+        appendBE32(UInt32(8 + hdlr.count + keys.count + ilst.count), to: &meta)
+        meta.append(contentsOf: Array("meta".utf8))
+        meta.append(hdlr)
+        meta.append(keys)
+        meta.append(ilst)
+        return meta
+    }
+
+    /// One indexed ilst item holding the identifier as UTF-8 text.
+    private static func buildIlstItem(contentIdentifier: String, index: UInt32) -> Data {
+        let uuid = Array(contentIdentifier.utf8)
+        var dataAtom = Data()
+        appendBE32(UInt32(8 + 4 + 4 + uuid.count), to: &dataAtom)
+        dataAtom.append(contentsOf: Array("data".utf8))
+        appendBE32(1, to: &dataAtom)
+        appendBE32(0, to: &dataAtom)
+        dataAtom.append(contentsOf: uuid)
+        var item = Data()
+        appendBE32(UInt32(8 + dataAtom.count), to: &item)
+        appendBE32(index, to: &item)
+        item.append(dataAtom)
         return item
+    }
+
+    /// Find the first child atom named `type` in `data[range]`.
+    /// Returns (offset, size) or nil.
+    private static func findChildAtom(in data: Data, range: Range<Int>,
+                                      type: String) -> (offset: Int, size: Int)? {
+        let typeBytes = Array(type.utf8)
+        var p = range.lowerBound
+        while p + 8 <= range.upperBound {
+            let size = Int(readBE32(data, at: p))
+            guard size >= 8, p + size <= range.upperBound else { return nil }
+            if Array(data[(p + 4)..<(p + 8)]) == typeBytes {
+                return (p, size)
+            }
+            p += size
+        }
+        return nil
+    }
+
+    private static func readBE32(_ data: Data, at offset: Int) -> UInt32 {
+        (UInt32(data[offset]) << 24) | (UInt32(data[offset + 1]) << 16)
+            | (UInt32(data[offset + 2]) << 8) | UInt32(data[offset + 3])
+    }
+
+    private static func setBE32(_ data: inout Data, at offset: Int, value: UInt32) {
+        data[offset] = UInt8((value >> 24) & 0xFF)
+        data[offset + 1] = UInt8((value >> 16) & 0xFF)
+        data[offset + 2] = UInt8((value >> 8) & 0xFF)
+        data[offset + 3] = UInt8(value & 0xFF)
     }
 }
 

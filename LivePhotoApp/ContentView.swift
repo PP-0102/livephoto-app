@@ -18,6 +18,9 @@ final class ImageViewModel: ObservableObject {
     @Published var liveSavedIDs: Set<String> = []
     @Published var liveSavingIDs: Set<String> = []
     @Published var isSavingAllLive = false
+    /// The .livp file to share (set when an export finishes).
+    @Published var livpShareURL: URL? = nil
+    @Published var exportingLivpIDs: Set<String> = []
 
     /// The items in this note that are Live Photos (have a motion clip).
     var liveItems: [ImageItem] {
@@ -95,6 +98,28 @@ final class ImageViewModel: ObservableObject {
             }
         }
         liveSavingIDs.remove(item.id)
+    }
+
+    /// Export one Live Photo as a .livp file and open the share sheet.
+    /// The .livp holds exactly the JPEG + MOV the app produces, so its
+    /// bytes can be inspected when the direct save keeps failing.
+    func exportLivp(item: ImageItem) async {
+        guard item.livePhotoClipURL != nil,
+              !exportingLivpIDs.contains(item.id) else { return }
+        exportingLivpIDs.insert(item.id)
+        status = "正在生成第 \(item.id) 张实况文件…"
+        do {
+            let data = try await LivePhotoSaver.makeLivpData(item: item)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("IMG_\(item.id).livp")
+            try data.write(to: url, options: [.atomic])
+            livpShareURL = url
+            status = "第 \(item.id) 张实况文件已生成，请在分享里发给我检查"
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            status = "第 \(item.id) 张实况文件生成失败：\(reason)"
+        }
+        exportingLivpIDs.remove(item.id)
     }
 
     /// Save every Live Photo in the list, one after another.
@@ -357,11 +382,15 @@ struct ContentView: View {
                         isSaving: viewModel.savingIDs.contains(item.id),
                         isLiveSaved: viewModel.liveSavedIDs.contains(item.id),
                         isLiveSaving: viewModel.liveSavingIDs.contains(item.id),
+                        isExportingLivp: viewModel.exportingLivpIDs.contains(item.id),
                         onSave: {
                             Task { await viewModel.save(item: item) }
                         },
                         onSaveLive: {
                             Task { await viewModel.saveLivePhoto(item: item) }
+                        },
+                        onExportLivp: {
+                            Task { await viewModel.exportLivp(item: item) }
                         }
                     )
                 }
@@ -370,6 +399,14 @@ struct ContentView: View {
             .padding()
             .navigationTitle("图片下载")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: Binding(
+                get: { viewModel.livpShareURL != nil },
+                set: { if !$0 { viewModel.livpShareURL = nil } }
+            )) {
+                if let url = viewModel.livpShareURL {
+                    ShareSheet(url: url)
+                }
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
@@ -459,8 +496,10 @@ struct ImageRow: View {
     let isSaving: Bool
     let isLiveSaved: Bool
     let isLiveSaving: Bool
+    let isExportingLivp: Bool
     let onSave: () -> Void
     let onSaveLive: () -> Void
+    let onExportLivp: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -525,6 +564,19 @@ struct ImageRow: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isLiveSaved || isLiveSaving)
+
+                // Export the exact JPEG + MOV as a .livp file, for
+                // inspection when the direct save keeps failing.
+                Button(action: onExportLivp) {
+                    if isExportingLivp {
+                        ProgressView()
+                    } else {
+                        Text("导出")
+                            .font(.subheadline)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isExportingLivp)
             }
 
             Button(action: onSave) {
@@ -544,6 +596,18 @@ struct ImageRow: View {
         }
         .padding(.vertical, 4)
     }
+}
+
+/// Share sheet for the exported .livp file.
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController,
+                                context: Context) {}
 }
 
 struct ContentView_Previews: PreviewProvider {
