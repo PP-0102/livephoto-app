@@ -667,7 +667,6 @@ struct LogView: View {
                     Button("导出日志") {
                         viewModel.exportLog()
                     }
-                    .fontWeight(.semibold)
                 }
             }
             .onAppear {
