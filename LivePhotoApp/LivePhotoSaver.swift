@@ -89,9 +89,8 @@ struct LivePhotoSaver {
             try? FileManager.default.removeItem(at: mp4URL)
             try? FileManager.default.removeItem(at: movURL)
         }
-        // Save as one Live Photo asset (.photo + .pairedVideo), passing
-        // the file contents as Data so Photos can read the identifiers.
-        // (File URLs made Photos reject the pair with error -1.)
+        // Save as one Live Photo asset (.photo + .pairedVideo).
+        // Try file URLs first, then Data as a fallback (see performSave).
         try await performSave(jpgURL: jpgURL, movURL: movURL)
     }
 
@@ -507,28 +506,67 @@ struct LivePhotoSaver {
 
     // MARK: - Save to Photos
 
-    /// Save the still + clip as one Live Photo asset, passing both
-    /// files as Data. File URLs were tried in every build and always
-    /// failed with PHPhotosErrorDomain -1 (Photos cannot validate the
-    /// shared content identifier from file URLs), so only Data is used.
-    /// The temp files are read here and can be removed by the caller
-    /// afterwards.
+    /// Save the still + clip as one Live Photo asset.
+    ///
+    /// Tries file URLs first, then Data as a fallback, and logs both
+    /// results. Why this order: file URLs were tried in every earlier
+    /// build and always failed with PHPhotosErrorDomain -1 (Photos
+    /// could not validate the shared content identifier from file
+    /// URLs) — BUT every one of those attempts used the broken still
+    /// whose MakerNote sat directly in IFD0 with no Make tag, so Photos
+    /// could not read the still's identifier at all. The still is
+    /// fixed now (MakerNote in the Exif sub-IFD, Make "Apple"), so
+    /// file URLs have never been tried with a readable still and may
+    /// work now. Data has failed with 3300 in every build so far, so
+    /// it is only the fallback; if both fail, the Data error is
+    /// reported and both errors stay in the log.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        let jpgData: Data
-        let movData: Data
+        LivePhotoLog.shared.append("正在保存到相册（文件方式）…")
         do {
-            jpgData = try Data(contentsOf: jpgURL)
-            movData = try Data(contentsOf: movURL)
-        } catch {
-            LivePhotoLog.shared.append("读取照片/视频文件失败")
-            throw LivePhotoError.saveFailed
+            try await performSaveOnce(jpgURL: jpgURL, movURL: movURL, asData: false)
+            LivePhotoLog.shared.append("相册保存成功（文件方式）✓")
+            return
+        } catch let fileError as LivePhotoError {
+            LivePhotoLog.shared.append("文件方式失败：\(fileError.localizedDescription)")
+            LivePhotoLog.shared.append("改用数据方式重试…")
+            do {
+                try await performSaveOnce(jpgURL: jpgURL, movURL: movURL, asData: true)
+                LivePhotoLog.shared.append("相册保存成功（数据方式）✓")
+                return
+            } catch let dataError as LivePhotoError {
+                LivePhotoLog.shared.append("数据方式也失败：\(dataError.localizedDescription)")
+                throw dataError
+            }
         }
-        LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData.count / 1024) KB + 视频 \(movData.count / 1024) KB）…")
+    }
+
+    /// One attempt to save the pair, either as file URLs or as Data.
+    private static func performSaveOnce(jpgURL: URL, movURL: URL, asData: Bool) async throws {
+        let jpgData: Data?
+        let movData: Data?
+        if asData {
+            do {
+                jpgData = try Data(contentsOf: jpgURL)
+                movData = try Data(contentsOf: movURL)
+            } catch {
+                LivePhotoLog.shared.append("读取照片/视频文件失败")
+                throw LivePhotoError.saveFailed
+            }
+            LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData!.count / 1024) KB + 视频 \(movData!.count / 1024) KB）…")
+        } else {
+            jpgData = nil
+            movData = nil
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: jpgData, options: nil)
-                request.addResource(with: .pairedVideo, data: movData, options: nil)
+                if asData {
+                    request.addResource(with: .photo, data: jpgData!, options: nil)
+                    request.addResource(with: .pairedVideo, data: movData!, options: nil)
+                } else {
+                    request.addResource(with: .photo, fileURL: jpgURL, options: nil)
+                    request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
+                }
             }, completionHandler: { success, error in
                 if let error = error as NSError? {
                     LivePhotoLog.shared.append("相册保存失败：\(error.domain) \(error.code)：\(error.localizedDescription)")
@@ -536,7 +574,6 @@ struct LivePhotoSaver {
                         domain: error.domain, code: error.code,
                         message: error.localizedDescription))
                 } else if success {
-                    LivePhotoLog.shared.append("相册保存成功 ✓")
                     continuation.resume()
                 } else {
                     LivePhotoLog.shared.append("相册保存失败（无错误信息）")
