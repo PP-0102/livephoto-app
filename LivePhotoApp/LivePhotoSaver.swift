@@ -519,7 +519,7 @@ extension LivePhotoSaver {
         while let sample = readerOutput.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             while !videoInput.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(5))
+                try await Task.sleep(nanoseconds: 5_000_000)
             }
             guard videoInput.append(sample) else {
                 throw LivePhotoError.videoEncodeFailed
@@ -528,7 +528,7 @@ extension LivePhotoSaver {
             let info = try LivePhotoMetadata.infoSample(
                 format: infoFormat, at: pts, duration: frameDuration)
             while !infoInput.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(5))
+                try await Task.sleep(nanoseconds: 5_000_000)
             }
             guard infoInput.append(info) else {
                 throw LivePhotoError.videoEncodeFailed
