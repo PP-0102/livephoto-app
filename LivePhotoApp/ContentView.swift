@@ -21,6 +21,34 @@ final class ImageViewModel: ObservableObject {
     /// The .livp file to share (set when an export finishes).
     @Published var livpShareURL: URL? = nil
     @Published var exportingLivpIDs: Set<String> = []
+    /// The run log text shown in the log sheet.
+    @Published var logText = ""
+    @Published var isShowingLog = false
+    /// The exported log .txt file to share.
+    @Published var logShareURL: URL? = nil
+
+    /// Reload the run log from the saver.
+    func refreshLog() {
+        logText = LivePhotoLog.shared.text
+        if logText.isEmpty {
+            logText = "（还没有日志。解析并保存一张实况后，这里会显示每一步的运行过程。）"
+        }
+    }
+
+    /// Export the run log as a .txt file and open the share sheet.
+    func exportLog() {
+        if let url = LivePhotoLog.shared.exportURL() {
+            logShareURL = url
+        } else {
+            status = "日志导出失败"
+        }
+    }
+
+    /// Clear the run log.
+    func clearLog() {
+        LivePhotoLog.shared.clear()
+        refreshLog()
+    }
 
     /// The items in this note that are Live Photos (have a motion clip).
     var liveItems: [ImageItem] {
@@ -327,11 +355,20 @@ struct ContentView: View {
                     .disabled(viewModel.isParsing || viewModel.isSavingAll || viewModel.linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
-                // Status line
-                if !viewModel.status.isEmpty {
-                    Text(viewModel.status)
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
+                // Status line + log button
+                HStack(alignment: .top, spacing: 8) {
+                    if !viewModel.status.isEmpty {
+                        Text(viewModel.status)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("日志") {
+                        viewModel.refreshLog()
+                        viewModel.isShowingLog = true
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.subheadline)
                 }
 
                 // Video card (for a video note)
@@ -406,6 +443,9 @@ struct ContentView: View {
                 if let url = viewModel.livpShareURL {
                     ShareSheet(url: url)
                 }
+            }
+            .sheet(isPresented: $viewModel.isShowingLog) {
+                LogView(viewModel: viewModel)
             }
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
@@ -595,6 +635,53 @@ struct ImageRow: View {
             .disabled(isSaved || isSaving)
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// Run log sheet: shows every step of the Live Photo save/export with
+/// timestamps, so a failure can be pinpointed — and the log can be
+/// exported as a .txt file and sent for inspection.
+struct LogView: View {
+    @ObservedObject var viewModel: ImageViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                Text(viewModel.logText)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .textSelection(.enabled)
+            }
+            .navigationTitle("运行日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button("清空") {
+                        viewModel.clearLog()
+                    }
+                    Button("导出日志") {
+                        viewModel.exportLog()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+            .onAppear {
+                viewModel.refreshLog()
+            }
+            .sheet(isPresented: Binding(
+                get: { viewModel.logShareURL != nil },
+                set: { if !$0 { viewModel.logShareURL = nil } }
+            )) {
+                if let url = viewModel.logShareURL {
+                    ShareSheet(url: url)
+                }
+            }
+        }
     }
 }
 

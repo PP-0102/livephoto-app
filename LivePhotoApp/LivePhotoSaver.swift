@@ -110,6 +110,7 @@ struct LivePhotoSaver {
         let jpgData = try Data(contentsOf: jpgURL)
         let movData = try Data(contentsOf: movURL)
         let stem = "IMG_\(item.id)"
+        LivePhotoLog.shared.append("实况文件已生成：\(stem).livp（照片 \(jpgData.count / 1024) KB + 视频 \(movData.count / 1024) KB）")
         return zipStored(files: [(stem + ".JPG", jpgData), (stem + ".MOV", movData)])
     }
 
@@ -190,30 +191,41 @@ struct LivePhotoSaver {
         guard let clipURL = item.livePhotoClipURL else {
             throw LivePhotoError.notLivePhoto
         }
+        LivePhotoLog.shared.append("—— 开始处理第 \(item.id) 张实况 ——")
         // 1. Download the still (original first, 1080px fallback).
         let stillData: Data
         do {
             stillData = try await downloadImageData(from: item.imageURL)
+            LivePhotoLog.shared.append("原图下载完成：\(stillData.count / 1024) KB")
         } catch {
+            LivePhotoLog.shared.append("原图下载失败，改用 1080px 版本")
             do {
                 stillData = try await downloadImageData(from: item.fallbackURL)
+                LivePhotoLog.shared.append("1080px 图下载完成：\(stillData.count / 1024) KB")
             } catch {
+                LivePhotoLog.shared.append("图片下载失败")
                 throw LivePhotoError.downloadFailed
             }
         }
         guard let image = UIImage(data: stillData), let cgImage = image.cgImage else {
+            LivePhotoLog.shared.append("图片解码失败")
             throw LivePhotoError.invalidImage
         }
+        LivePhotoLog.shared.append("照片尺寸：\(cgImage.width)×\(cgImage.height)")
         // 2. Download the motion clip to a temp .mp4 file.
         let mp4URL: URL
         do {
             mp4URL = try await downloadVideoFile(from: clipURL)
+            let size = (try? FileManager.default.attributesOfItem(atPath: mp4URL.path)[.size] as? Int) ?? 0
+            LivePhotoLog.shared.append("动图下载完成：\(size / 1024) KB")
         } catch {
+            LivePhotoLog.shared.append("动图下载失败")
             throw LivePhotoError.downloadFailed
         }
 
         // 3. One shared content identifier for the still and the clip.
         let contentIdentifier = UUID().uuidString.uppercased()
+        LivePhotoLog.shared.append("配对标识：\(contentIdentifier)")
 
         // 4. Write the tagged JPEG still and the transcoded + tagged .mov.
         let tempDir = FileManager.default.temporaryDirectory
@@ -223,11 +235,16 @@ struct LivePhotoSaver {
         do {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
                           contentIdentifier: contentIdentifier)
+            LivePhotoLog.shared.append("照片已写入（MakerNote 在 Exif 子目录，Make=Apple）")
             try await transcodeLivePhotoVideo(inputURL: mp4URL, outputURL: movURL,
                                               contentIdentifier: contentIdentifier)
+            let movSize = (try? FileManager.default.attributesOfItem(atPath: movURL.path)[.size] as? Int) ?? 0
+            LivePhotoLog.shared.append("视频已生成：\(movSize / 1024) KB，标识已写入 moov>meta")
         } catch let error as LivePhotoError {
+            LivePhotoLog.shared.append("处理失败：\(error.errorDescription ?? error.localizedDescription)")
             throw error
         } catch {
+            LivePhotoLog.shared.append("处理失败：\(error.localizedDescription)")
             throw LivePhotoError.saveFailed
         }
         return (jpgURL, movURL, mp4URL)
@@ -503,8 +520,10 @@ struct LivePhotoSaver {
             jpgData = try Data(contentsOf: jpgURL)
             movData = try Data(contentsOf: movURL)
         } catch {
+            LivePhotoLog.shared.append("读取照片/视频文件失败")
             throw LivePhotoError.saveFailed
         }
+        LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData.count / 1024) KB + 视频 \(movData.count / 1024) KB）…")
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
@@ -512,12 +531,15 @@ struct LivePhotoSaver {
                 request.addResource(with: .pairedVideo, data: movData, options: nil)
             }, completionHandler: { success, error in
                 if let error = error as NSError? {
+                    LivePhotoLog.shared.append("相册保存失败：\(error.domain) \(error.code)：\(error.localizedDescription)")
                     continuation.resume(throwing: LivePhotoError.photosError(
                         domain: error.domain, code: error.code,
                         message: error.localizedDescription))
                 } else if success {
+                    LivePhotoLog.shared.append("相册保存成功 ✓")
                     continuation.resume()
                 } else {
+                    LivePhotoLog.shared.append("相册保存失败（无错误信息）")
                     continuation.resume(throwing: LivePhotoError.saveFailed)
                 }
             })
@@ -535,18 +557,23 @@ extension LivePhotoSaver {
     /// H.264 fails on the device.
     private static func transcodeLivePhotoVideo(inputURL: URL, outputURL: URL,
                                                 contentIdentifier: String) async throws {
+        LivePhotoLog.shared.append("开始转码视频（H.264）…")
         do {
             try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                      contentIdentifier: contentIdentifier,
                                      codec: .h264)
+            LivePhotoLog.shared.append("H.264 转码完成")
         } catch {
             // H.264 failed on this device; retry once with HEVC.
+            LivePhotoLog.shared.append("H.264 转码失败，改用 HEVC 重试")
             try? FileManager.default.removeItem(at: outputURL)
             do {
                 try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                          contentIdentifier: contentIdentifier,
                                          codec: .hevc)
+                LivePhotoLog.shared.append("HEVC 转码完成")
             } catch {
+                LivePhotoLog.shared.append("HEVC 转码也失败")
                 throw LivePhotoError.videoEncodeFailed
             }
         }
@@ -580,6 +607,8 @@ extension LivePhotoSaver {
         guard width > 0, height > 0 else { throw LivePhotoError.noVideoTrack }
         let duration = videoTrack.timeRange.duration
         guard duration > .zero else { throw LivePhotoError.noVideoTrack }
+        let fps = videoTrack.nominalFrameRate
+        LivePhotoLog.shared.append("原动图：\(Int(naturalSize.width))×\(Int(naturalSize.height))，时长 \(String(format: "%.2f", duration.seconds)) 秒，帧率 \(String(format: "%.1f", fps))")
 
         // Reader: decode the source to yuv420p pixel buffers.
         let reader: AVAssetReader
@@ -898,3 +927,58 @@ extension LivePhotoSaver {
     }
 }
 
+
+/// 运行过程日志：实况保存/导出每一步都记一行（带时间），出错时
+/// 把完整错误也记下来。App 内可以查看，也可以导出成 .txt 发出来检查。
+/// 线程安全：保存流程在后台任务里跑，UI 在主线程读。
+final class LivePhotoLog {
+    static let shared = LivePhotoLog()
+
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    private init() {}
+
+    /// 记一行，前面带时:分:秒.毫秒。
+    func append(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let stamp = formatter.string(from: Date())
+        lock.lock()
+        lines.append("[\(stamp)] \(message)")
+        lock.unlock()
+    }
+
+    /// 清空全部日志。
+    func clear() {
+        lock.lock()
+        lines.removeAll()
+        lock.unlock()
+    }
+
+    /// 全部日志文本（每行一条）。
+    var text: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 是否有内容。
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines.isEmpty
+    }
+
+    /// 把日志写成一个临时 .txt 文件，返回它的地址（供分享导出）。
+    func exportURL() -> URL? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("实况保存日志.txt")
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+}
