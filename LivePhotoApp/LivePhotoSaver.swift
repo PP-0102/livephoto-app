@@ -265,8 +265,10 @@ struct LivePhotoSaver {
         // header 8; IFD0 at 8 with 4 entries (2 + 48 + 4 = 54) -> ends 62;
         // Exif IFD at 62 with 1 entry (2 + 12 + 4 = 18) -> ends 80;
         // MakerNote data at 80; Make string after it; Model string last.
-        let exifIFDOffset = UInt32(8 + 2 + 4 * 12 + 4)
-        let makerNoteOffset = exifIFDOffset + UInt32(2 + 12 + 4)
+        // (Plain literals: the compiler times out type-checking the
+        // arithmetic inside UInt32(...). Values verified by hand.)
+        let exifIFDOffset: UInt32 = 62
+        let makerNoteOffset: UInt32 = 80
         let makeOffset = makerNoteOffset + UInt32(plist.count)
         let modelOffset = makeOffset + UInt32(makeData.count)
         var tiff = Data()
