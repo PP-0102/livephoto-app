@@ -42,23 +42,24 @@ enum LivePhotoError: LocalizedError {
 /// Saves one Xiaohongshu Live Photo (实况) to the Photos library as a real
 /// Live Photo (.photo + .pairedVideo sharing one content identifier).
 ///
-/// This is the part that failed in the standalone 实况下载 app (v1–v14).
-/// The difference here, taken from the open-source glitter-live recipe
-/// (which ships a working Live Photo writer):
-///  1. The content identifier is written with the official API —
+/// History: the standalone 实况下载 app (v1–v14) never got a save to work
+/// (errors -1 and 3300). The first build inside this app used the
+/// glitter-live recipe (HEVC + writer.metadata + live-photo-info /
+/// still-image-time tracks) and STILL failed with 3300 on all 7 photos
+/// of the test note (2026-11-16). What changed for this build:
+///  1. The content identifier is still written with the official API —
 ///     `AVAssetWriter.metadata` with a `.quickTimeMetadataContentIdentifier`
-///     item — instead of byte-injecting a meta atom after the encode.
-///     The byte-injected meta is what Photos' video converter kept
-///     rejecting (PHPhotosErrorDomain 3300 = videoConversionFailed).
-///  2. The video is HEVC (8-bit SDR, BT.709), not H.264 — the Lock Screen
-///     rejects H.264 Live Photos, and HEVC matches what the iPhone camera
-///     writes. Falls back to H.264 if HEVC fails on the device.
-///  3. Two timed-metadata tracks are written into the .mov, exactly as
-///     the camera does: `live-photo-info` (one sample per frame) and
-///     `still-image-time` + `live-photo-still-image-transform` (one sample
-///     at the cover frame, in the 600 timescale, never at 0 s). Without
-///     them the file is a plain video with an identifier, not a Live Photo.
-///  4. The still's MakerNote is written byte by byte (binary plist
+///     item — not byte-injected.
+///  2. NO timed-metadata tracks. The iOS 17 camera reference values the
+///     tracks were built from are the prime suspect for 3300 on iOS 15.1:
+///     Photos' video converter has to process every track, and plain
+///     Photos only needs the shared identifier to pair still + video.
+///  3. H.264 first (the "Most Compatible" format), HEVC only as a
+///     fallback if H.264 encoding fails on the device.
+///  4. The save itself tries file URLs first, then the same files as
+///     Data, and reports both errors when neither works (the two methods
+///     fail differently: -1 vs 3300).
+///  5. The still's MakerNote is written byte by byte (binary plist
 ///     {17: <uuid>}) — verified on the VM to parse back correctly, and
 ///     verified on a real file the old app exported.
 struct LivePhotoSaver {
@@ -347,35 +348,60 @@ struct LivePhotoSaver {
 
     // MARK: - Save to Photos
 
-    /// One creation request with both resources, passed as Data.
-    /// Data is used (not file URLs) because with file URLs Photos could
-    /// not validate the shared content identifier (PHPhotosErrorDomain
-    /// -1); passing the bytes as Data lets Photos read the identifiers
-    /// and pair the still with the clip. The temp files are read here
-    /// and can be removed by the caller afterwards.
+    /// Save the still + clip as one Live Photo asset.
+    ///
+    /// Tries file URLs first, then the same files as Data. The two
+    /// methods fail differently on this device (file URLs gave -1,
+    /// Data gave 3300), and which one works depends on how Photos
+    /// reads the content identifier — so both are attempted, and both
+    /// errors are reported when neither works. The temp files must stay
+    /// in place until each attempt completes; the caller removes them
+    /// after this returns.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        let jpgData: Data
-        let movData: Data
-        do {
-            jpgData = try Data(contentsOf: jpgURL)
-            movData = try Data(contentsOf: movURL)
-        } catch {
-            throw LivePhotoError.saveFailed
+        // Attempt 1: file URLs.
+        if let fileError = await attemptSave(jpgURL: jpgURL, movURL: movURL, useFileURLs: true) {
+            // Attempt 2: the same files as Data.
+            if let dataError = await attemptSave(jpgURL: jpgURL, movURL: movURL, useFileURLs: false) {
+                throw LivePhotoError.photosError(
+                    domain: dataError.domain, code: dataError.code,
+                    message: "文件方式：\(fileError.localizedDescription)；数据方式：\(dataError.localizedDescription)")
+            }
         }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+    }
+
+    /// One performChanges attempt. Returns the error, or nil on success.
+    private static func attemptSave(jpgURL: URL, movURL: URL, useFileURLs: Bool) async -> NSError? {
+        let jpgData: Data?
+        let movData: Data?
+        if useFileURLs {
+            jpgData = nil
+            movData = nil
+        } else {
+            do {
+                jpgData = try Data(contentsOf: jpgURL)
+                movData = try Data(contentsOf: movURL)
+            } catch {
+                return NSError(domain: "LivePhotoSaver", code: -1,
+                               userInfo: [NSLocalizedDescriptionKey: "读取临时文件失败"])
+            }
+        }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<NSError?, Never>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: jpgData, options: nil)
-                request.addResource(with: .pairedVideo, data: movData, options: nil)
-            }, completionHandler: { success, error in
-                if let error = error as NSError? {
-                    continuation.resume(throwing: LivePhotoError.photosError(
-                        domain: error.domain, code: error.code,
-                        message: error.localizedDescription))
-                } else if success {
-                    continuation.resume()
+                if useFileURLs {
+                    request.addResource(with: .photo, fileURL: jpgURL, options: nil)
+                    request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
                 } else {
-                    continuation.resume(throwing: LivePhotoError.saveFailed)
+                    request.addResource(with: .photo, data: jpgData!, options: nil)
+                    request.addResource(with: .pairedVideo, data: movData!, options: nil)
+                }
+            }, completionHandler: { success, error in
+                if success {
+                    continuation.resume(returning: nil)
+                } else {
+                    continuation.resume(returning: error as NSError?
+                        ?? NSError(domain: "PHPhotosErrorDomain", code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "保存失败"]))
                 }
             })
         }
@@ -387,21 +413,22 @@ struct LivePhotoSaver {
 extension LivePhotoSaver {
 
     /// Transcode the motion clip into a Live Photo .mov.
-    /// Tries HEVC first (what the iPhone camera writes); falls back to
-    /// H.264 if HEVC fails on the device.
+    /// Tries H.264 first (the most widely accepted format — what the
+    /// iPhone writes in "Most Compatible" mode); falls back to HEVC if
+    /// H.264 fails on the device.
     private static func transcodeLivePhotoVideo(inputURL: URL, outputURL: URL,
                                                 contentIdentifier: String) async throws {
         do {
             try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                      contentIdentifier: contentIdentifier,
-                                     codec: .hevc)
+                                     codec: .h264)
         } catch {
-            // HEVC failed on this device; retry once with H.264.
+            // H.264 failed on this device; retry once with HEVC.
             try? FileManager.default.removeItem(at: outputURL)
             do {
                 try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                          contentIdentifier: contentIdentifier,
-                                         codec: .h264)
+                                         codec: .hevc)
             } catch {
                 throw LivePhotoError.videoEncodeFailed
             }
@@ -409,10 +436,14 @@ extension LivePhotoSaver {
     }
 
     /// Re-encode the clip with AVAssetWriter, writing the content
-    /// identifier through the official `writer.metadata` API and adding
-    /// the two timed-metadata tracks the camera writes (see
-    /// LivePhotoMetadata below). The still time is the middle of the
-    /// clip, snapped to a frame, in the 600 timescale, never at 0 s.
+    /// identifier through the official `writer.metadata` API.
+    ///
+    /// Deliberately NO timed-metadata tracks (live-photo-info /
+    /// still-image-time): the previous build wrote them from iOS 17
+    /// camera reference values, and Photos on iOS 15.1 still rejected
+    /// the video with 3300 (videoConversionFailed). Plain Photos only
+    /// needs the still and the video to share a content identifier;
+    /// the tracks are a Lock Screen extra, not a pairing requirement.
     private static func transcodeVideo(inputURL: URL, outputURL: URL,
                                        contentIdentifier: String,
                                        codec: AVVideoCodecType) async throws {
@@ -488,73 +519,27 @@ extension LivePhotoSaver {
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput.expectsMediaDataInRealTime = false
         videoInput.transform = videoTrack.preferredTransform
-
-        // Timed-metadata tracks (see LivePhotoMetadata).
-        let infoFormat = try LivePhotoMetadata.infoFormatDescription()
-        let stillFormat = try LivePhotoMetadata.stillFormatDescription()
-        let infoInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
-                                           sourceFormatHint: infoFormat)
-        let stillInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
-                                            sourceFormatHint: stillFormat)
-        for input in [videoInput, infoInput, stillInput] {
-            input.expectsMediaDataInRealTime = false
-            guard writer.canAdd(input) else { throw LivePhotoError.videoEncodeFailed }
-            writer.add(input)
-        }
-
-        let frameDuration = CMTime(value: 1, timescale: 30)
-        let stillTime = stillTimeForClip(duration: duration)
+        guard writer.canAdd(videoInput) else { throw LivePhotoError.videoEncodeFailed }
+        writer.add(videoInput)
 
         guard writer.startWriting() else { throw LivePhotoError.videoEncodeFailed }
         writer.startSession(atSourceTime: .zero)
 
-        // The still-image-time sample goes in first, at the cover frame.
-        guard stillInput.append(try LivePhotoMetadata.stillSample(
-            format: stillFormat, at: stillTime)) else {
-            throw LivePhotoError.videoEncodeFailed
-        }
-        stillInput.markAsFinished()
-
         reader.startReading()
         while let sample = readerOutput.copyNextSampleBuffer() {
-            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             while !videoInput.isReadyForMoreMediaData {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
             guard videoInput.append(sample) else {
                 throw LivePhotoError.videoEncodeFailed
             }
-            // One live-photo-info sample per frame, at the frame's time.
-            let info = try LivePhotoMetadata.infoSample(
-                format: infoFormat, at: pts, duration: frameDuration)
-            while !infoInput.isReadyForMoreMediaData {
-                try await Task.sleep(nanoseconds: 5_000_000)
-            }
-            guard infoInput.append(info) else {
-                throw LivePhotoError.videoEncodeFailed
-            }
         }
         if reader.status == .failed { throw LivePhotoError.videoEncodeFailed }
         videoInput.markAsFinished()
-        infoInput.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else {
             throw LivePhotoError.videoEncodeFailed
         }
-    }
-
-    /// Cover-frame time: the middle of the clip, at least 0.5 s in (the
-    /// Lock Screen rejects a cover earlier than ~0.33 s), snapped down to
-    /// a frame boundary, in the 600 timescale Apple uses, never at 0.
-    private static func stillTimeForClip(duration: CMTime) -> CMTime {
-        let frameRate: Double = 30
-        var seconds = max(0.5, duration.seconds / 2)
-        seconds = min(seconds, duration.seconds - 1.0 / frameRate)
-        let totalFrames = Int((duration.seconds * frameRate).rounded(.down))
-        let frameIndex = max(1, min(Int((seconds * frameRate).rounded(.down)),
-                                    totalFrames - 1))
-        return CMTimeConvertScale(CMTime(value: CMTimeValue(frameIndex), timescale: 30),
-                                  timescale: 600, method: .roundHalfAwayFromZero)
     }
 
     /// The content identifier as an official QuickTime metadata item.
@@ -567,195 +552,3 @@ extension LivePhotoSaver {
     }
 }
 
-// MARK: - Timed metadata tracks
-//
-// The two timed-metadata tracks a real iPhone Live Photo .mov carries.
-// Ported from glitter-live (github.com/BuddhaNag12/glitter-live), whose
-// layout and camera reference values come from LivePaper's measurements
-// on a real iPhone (github.com/Yuyang16Z/LivePaper, MIT). Apple doesn't
-// document these; iOS rejects files whose setup values or per-frame
-// payload differ from the camera's, so both are reproduced verbatim.
-
-enum LivePhotoMetadata {
-    private static let infoKey = "com.apple.quicktime.live-photo-info"
-    // The doubled prefix matches what the camera writes.
-    private static let infoDataType = "com.apple.quicktime.com.apple.quicktime.live-photo-info"
-    private static let stillImageTimeKey = "com.apple.quicktime.still-image-time"
-    private static let stillImageTransformKey = "com.apple.quicktime.live-photo-still-image-transform"
-
-    /// QuickTime well-known data types.
-    private static let rawDataType: UInt32 = 0
-    private static let int8DataType: UInt32 = 0x41
-    private static let float64MatrixDataType: UInt32 = 0x53
-
-    /// `live-photo-info`: one sample per video frame.
-    static func infoFormatDescription() throws -> CMFormatDescription {
-        var dimensions = Data()
-        dimensions.appendBigEndian(cameraDimensions.width)
-        dimensions.appendBigEndian(cameraDimensions.height)
-        let setup = Atom.make("cfgv", cameraSetupPlist) + Atom.make("dims", dimensions)
-        let key = keyDeclaration(infoKey)
-            + Atom.make("dtyp", reverseDNSType(infoDataType))
-            + Atom.make("setu", setup)
-            + Atom.make("ctps", Atom.make("dtyp", wellKnownType(rawDataType)))
-        return try formatDescription(keys: Atom.make(keyID: 1, key))
-    }
-
-    /// `still-image-time` + `live-photo-still-image-transform`: one sample at the cover frame.
-    static func stillFormatDescription() throws -> CMFormatDescription {
-        let time = keyDeclaration(stillImageTimeKey) + Atom.make("dtyp", wellKnownType(int8DataType))
-        let transform = keyDeclaration(stillImageTransformKey) + Atom.make("dtyp", wellKnownType(float64MatrixDataType))
-        return try formatDescription(keys: Atom.make(keyID: 1, time) + Atom.make(keyID: 2, transform))
-    }
-
-    static func infoSample(format: CMFormatDescription, at time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
-        try sample(Atom.make(keyID: 1, cameraInfoPayload), format: format, time: time, duration: duration)
-    }
-
-    /// `still-image-time` = -1 plus an identity transform.
-    static func stillSample(format: CMFormatDescription, at time: CMTime) throws -> CMSampleBuffer {
-        var identity = Data()
-        for value in [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0] { identity.appendBigEndian(value) }
-        let payload = Atom.make(keyID: 1, Data([0xFF])) + Atom.make(keyID: 2, identity)
-        return try sample(payload, format: format, time: time, duration: CMTime(value: 1, timescale: 600))
-    }
-
-    // MARK: Encoding
-
-    private static func keyDeclaration(_ key: String) -> Data {
-        Atom.make("keyd", Data("mdta".utf8) + Data(key.utf8))
-    }
-
-    private static func wellKnownType(_ type: UInt32) -> Data {
-        var data = Data()
-        data.appendBigEndian(UInt32(0))
-        data.appendBigEndian(type)
-        return data
-    }
-
-    private static func reverseDNSType(_ type: String) -> Data {
-        var data = Data()
-        data.appendBigEndian(UInt32(1))
-        data.append(Data(type.utf8))
-        return data
-    }
-
-    /// A `mebx` sample description: 6 reserved bytes, data reference index 1, then the key table.
-    private static func formatDescription(keys: Data) throws -> CMFormatDescription {
-        var body = Data(count: 6)
-        body.appendBigEndian(UInt16(1))
-        body.append(Atom.make("keys", keys))
-        let data = Atom.make("mebx", body)
-
-        var description: CMFormatDescription?
-        let status = data.withUnsafeBytes { buffer in
-            CMMetadataFormatDescriptionCreateFromBigEndianMetadataDescriptionData(
-                allocator: kCFAllocatorDefault,
-                bigEndianMetadataDescriptionData: buffer.bindMemory(to: UInt8.self).baseAddress!,
-                size: data.count,
-                flavor: nil,
-                formatDescriptionOut: &description
-            )
-        }
-        guard status == noErr, let description else { throw LivePhotoError.videoEncodeFailed }
-        return description
-    }
-
-    private static func sample(_ bytes: Data, format: CMFormatDescription, time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
-        var block: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes.count,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
-            dataLength: bytes.count, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block
-        )
-        guard status == noErr, let block else { throw LivePhotoError.videoEncodeFailed }
-        status = bytes.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: bytes.count)
-        }
-        guard status == noErr else { throw LivePhotoError.videoEncodeFailed }
-
-        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: time, decodeTimeStamp: .invalid)
-        var size = bytes.count
-        var sample: CMSampleBuffer?
-        status = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
-            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample
-        )
-        guard status == noErr, let sample else { throw LivePhotoError.videoEncodeFailed }
-        return sample
-    }
-
-    // MARK: Camera reference values
-
-    /// The camera's own capture size, kept as is whatever the actual video size.
-    private static let cameraDimensions = (width: UInt32(1920), height: UInt32(1440))
-
-    /// Binary plist naming iPhone OS 17.0 (21A5277h) and the capture framework versions.
-    private static let cameraSetupPlist = Data(hex:
-        "62706c6973743030d301020304050c5f10214c69766550686f746f4d65746164" +
-        "61746153657475704461746156657273696f6e5d53797374656d56657273696f" +
-        "6e5f10114672616d65776f726b56657273696f6e731001d3060708090a0b5f10" +
-        "1350726f647563744275696c6456657273696f6e5b50726f647563744e616d65" +
-        "5e50726f6475637456657273696f6e583231413532373768596950686f6e6520" +
-        "4f535431372e30d40d0e0f10111213145a436f72654d6f74696f6e5d434d4361" +
-        "7074757265436f72655e483130495350536572766963657359436f72654d6564" +
-        "696158323836382e302e32573434362e352e335432302e325e333034352e3639" +
-        "2e322e31312e340008000f0033004100550057005e00740080008f009800a200" +
-        "a700b000bb00c900d800e200eb00f300f8000000000000020100000000000000" +
-        "1500000000000000000000000000000107")
-
-    /// One camera-info record, repeated in every frame as the camera does.
-    private static let cameraInfoPayload = Data(hex:
-        "03000000bdc36d3ce3b5eb6d800000007b80ad425a2d64410a08cb3e7feea6bd" +
-        "79e9f63f000080400400ff000000000000000000000000000000000000000000" +
-        "07000000525e873ee66e52bf1b2a6ac4d37862bf761ed23dde3f8ec313f52f39" +
-        "b2f04439ff309dbf1a17f1ed1b070000206796ed1b0700000000000000000000" +
-        "0000000000000000")
-}
-
-/// QuickTime atoms are `[size: UInt32][type: 4 bytes][payload]`.
-private enum Atom {
-    static func make(_ fourCC: String, _ payload: Data) -> Data {
-        var atom = Data()
-        atom.appendBigEndian(UInt32(8 + payload.count))
-        atom.append(Data(fourCC.utf8))
-        atom.append(payload)
-        return atom
-    }
-
-    /// Key tables and metadata samples use the local key ID in place of a four-character type.
-    static func make(keyID: UInt32, _ payload: Data) -> Data {
-        var atom = Data()
-        atom.appendBigEndian(UInt32(8 + payload.count))
-        atom.appendBigEndian(keyID)
-        atom.append(payload)
-        return atom
-    }
-}
-
-private extension Data {
-    init(hex: String) {
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(hex.count / 2)
-        var index = hex.startIndex
-        while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2)
-            bytes.append(UInt8(hex[index..<next], radix: 16)!)
-            index = next
-        }
-        self.init(bytes)
-    }
-
-    mutating func appendBigEndian(_ value: UInt32) {
-        Swift.withUnsafeBytes(of: value.bigEndian) { append(contentsOf: $0) }
-    }
-
-    mutating func appendBigEndian(_ value: UInt16) {
-        Swift.withUnsafeBytes(of: value.bigEndian) { append(contentsOf: $0) }
-    }
-
-    mutating func appendBigEndian(_ value: Double) {
-        Swift.withUnsafeBytes(of: value.bitPattern.bigEndian) { append(contentsOf: $0) }
-    }
-}
