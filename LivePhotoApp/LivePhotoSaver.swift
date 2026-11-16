@@ -75,10 +75,20 @@ enum LivePhotoError: LocalizedError {
 ///     WORSE: Photos rejected the untouched original bitstream
 ///     instantly (3300 in 2–50 ms), while the re-encoded video got as
 ///     far as ~8s of conversion work in run #38.
-///  4. The save passes both files as Data. File URLs were tried in run
-///     #38 with the fixed still and still failed with -1 every time,
-///     so they are not attempted.
-///  5. makeLivpData() exports the exact same pair as a .livp file, so
+///  4. The save tries file URLs first, then Data as a fallback, and
+///     logs both results. The working open-source recipe (glitter-live)
+///     saves with file URLs — and that combination, file URLs + the
+///     system-written MakerNote still, was never tried: every earlier
+///     file-URL attempt used the hand-built EXIF still, and every
+///     Data attempt since the still was fixed used Data.
+///  5. Before saving, the pair is validated locally with
+///     PHLivePhoto.request (the same check glitter-live uses):
+///     Photos only returns a Live Photo for a correctly paired still
+///     and movie. A passing validation with a failing save points at
+///     the save path/environment; a failing validation points at the
+///     files themselves. The validation never blocks the save — both
+///     results are logged either way.
+///  6. makeLivpData() exports the exact same pair as a .livp file, so
 ///     the bytes the app produces can be inspected when the direct
 ///     save still fails.
 struct LivePhotoSaver {
@@ -99,6 +109,8 @@ struct LivePhotoSaver {
             try? FileManager.default.removeItem(at: mp4URL)
             try? FileManager.default.removeItem(at: movURL)
         }
+        // Validate the pair locally first (never blocks the save).
+        await validatePair(jpgURL: jpgURL, movURL: movURL)
         // Save as one Live Photo asset (.photo + .pairedVideo).
         // Try file URLs first, then Data as a fallback (see performSave).
         try await performSave(jpgURL: jpgURL, movURL: movURL)
@@ -363,41 +375,126 @@ struct LivePhotoSaver {
         data.append(UInt8((value >> 24) & 0xFF))
     }
 
+    /// Ask Photos itself whether the still + clip form a valid Live
+    /// Photo, WITHOUT touching the library. PHLivePhoto.request only
+    /// returns a Live Photo for a correctly paired still and movie
+    /// (this is the validation the open-source glitter-live app uses:
+    /// "Photos only returns a Live Photo for a correctly paired still
+    /// and movie"). The result is logged and never blocks the save
+    /// attempt: a passing validation with a failing save points at the
+    /// save path/environment, while a failing validation points at the
+    /// files themselves.
+    private static func validatePair(jpgURL: URL, movURL: URL) async {
+        let asset = AVURLAsset(url: movURL)
+        let size = asset.tracks(withMediaType: .video).first?.naturalSize
+            ?? CGSize(width: 1080, height: 1440)
+        let gate = OnceGate()
+        let result: String = await withCheckedContinuation { continuation in
+            PHLivePhoto.request(withResourceFileURLs: [jpgURL, movURL],
+                                placeholderImage: nil,
+                                targetSize: size,
+                                contentMode: .aspectFill) { livePhoto, info in
+                // The handler can fire first with a degraded preview;
+                // wait for the full result.
+                if (info[PHLivePhotoInfoIsDegradedKey] as? Bool) == true { return }
+                guard gate.claim() else { return }
+                if let error = info[PHLivePhotoInfoErrorKey] as? NSError {
+                    continuation.resume(returning: "失败：\(error.domain) \(error.code)：\(error.localizedDescription)")
+                } else if livePhoto != nil {
+                    continuation.resume(returning: "通过：相册认出这是一张实况照片")
+                } else {
+                    continuation.resume(returning: "失败：相册没有认出实况照片（无错误信息）")
+                }
+            }
+            // Safety net: if Photos never calls back, don't hang the save.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                guard gate.claim() else { return }
+                continuation.resume(returning: "超时：10 秒内相册没有回应")
+            }
+        }
+        LivePhotoLog.shared.append("实况校验：\(result)")
+    }
+
+    /// One-shot gate: the result handler can fire several times, so only
+    /// the first claim resumes the continuation.
+    private final class OnceGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var claimed = false
+        func claim() -> Bool {
+            lock.withLock {
+                defer { claimed = true }
+                return !claimed
+            }
+        }
+    }
+
     // MARK: - Save to Photos
 
-    /// Save the still + clip as one Live Photo asset, passing both
-    /// files as Data. File URLs were tried in run #38 with the fixed
-    /// still (MakerNote in the Exif sub-IFD, Make "Apple") and still
-    /// failed with PHPhotosErrorDomain -1 every time, so they are not
-    /// attempted. The temp files are read here and can be removed by
-    /// the caller afterwards.
+    /// Save the still + clip as one Live Photo asset.
+    /// Tries file URLs first, then Data as a fallback, and logs both
+    /// results. The working open-source recipe (glitter-live) saves
+    /// with file URLs — and that combination, file URLs + the
+    /// system-written MakerNote still, was never tried: every earlier
+    /// file-URL attempt used the hand-built EXIF still, and every Data
+    /// attempt since the still was fixed used Data. The temp files are
+    /// removed by the caller afterwards.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        let jpgData: Data
-        let movData: Data
+        // Attempt 1: file URLs.
         do {
-            jpgData = try Data(contentsOf: jpgURL)
-            movData = try Data(contentsOf: movURL)
+            LivePhotoLog.shared.append("正在保存到相册（文件方式）…")
+            try await saveOnce(jpgURL: jpgURL, movURL: movURL, asData: false)
+            LivePhotoLog.shared.append("相册保存成功 ✓（文件方式）")
+            return
         } catch {
-            LivePhotoLog.shared.append("读取照片/视频文件失败")
-            throw LivePhotoError.saveFailed
+            LivePhotoLog.shared.append("文件方式失败：\(error.localizedDescription)")
         }
-        LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData.count / 1024) KB + 视频 \(movData.count / 1024) KB）…")
+        // Attempt 2: Data.
+        do {
+            LivePhotoLog.shared.append("改用数据方式重试…")
+            try await saveOnce(jpgURL: jpgURL, movURL: movURL, asData: true)
+            LivePhotoLog.shared.append("相册保存成功 ✓（数据方式）")
+        } catch {
+            LivePhotoLog.shared.append("数据方式失败：\(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    /// One performChanges save attempt, either with file URLs or with
+    /// the files read into Data. Throws the exact Photos error.
+    private static func saveOnce(jpgURL: URL, movURL: URL, asData: Bool) async throws {
+        let jpgData: Data?
+        let movData: Data?
+        if asData {
+            do {
+                jpgData = try Data(contentsOf: jpgURL)
+                movData = try Data(contentsOf: movURL)
+            } catch {
+                LivePhotoLog.shared.append("读取照片/视频文件失败")
+                throw LivePhotoError.saveFailed
+            }
+            LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData!.count / 1024) KB + 视频 \(movData!.count / 1024) KB）…")
+        } else {
+            jpgData = nil
+            movData = nil
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: jpgData, options: nil)
-                request.addResource(with: .pairedVideo, data: movData, options: nil)
+                if asData {
+                    request.addResource(with: .photo, data: jpgData!, options: nil)
+                    request.addResource(with: .pairedVideo, data: movData!, options: nil)
+                } else {
+                    request.addResource(with: .photo, fileURL: jpgURL, options: nil)
+                    request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
+                }
             }, completionHandler: { success, error in
                 if let error = error as NSError? {
-                    LivePhotoLog.shared.append("相册保存失败：\(error.domain) \(error.code)：\(error.localizedDescription)")
                     continuation.resume(throwing: LivePhotoError.photosError(
                         domain: error.domain, code: error.code,
                         message: error.localizedDescription))
                 } else if success {
-                    LivePhotoLog.shared.append("相册保存成功 ✓")
                     continuation.resume()
                 } else {
-                    LivePhotoLog.shared.append("相册保存失败（无错误信息）")
                     continuation.resume(throwing: LivePhotoError.saveFailed)
                 }
             })
