@@ -74,7 +74,19 @@ enum LivePhotoError: LocalizedError {
 ///     remux (Passthrough, no re-encode) was tried in run #39 and was
 ///     WORSE: Photos rejected the untouched original bitstream
 ///     instantly (3300 in 2–50 ms), while the re-encoded video got as
-///     far as ~8s of conversion work in run #38.
+///     far as ~8s of conversion work in run #38. NO B-frames
+///     (AllowFrameReordering false): with B-frames the encoder wrote
+///     a ctts version 0 table with NEGATIVE composition offsets
+///     (-23/-22 ticks, stored as 4294967273/4294967274), which any
+///     strict reader sees as frames ~71 million seconds in the
+///     future — the video was invalid, and Photos' validator rejected
+///     it with 3302 in run #41 (found by inspecting the run #41 .livp
+///     export on the VM; the source clip's own ctts has only positive
+///     offsets, so the negative ones came from our re-encode). The
+///     still was verified correct in that same inspection: the
+///     CGImageDestination writes a genuine Apple iOS MakerNote
+///     ("Apple iOS\0" + IFD, tag 17 = the UUID), matching the MOV's
+///     content identifier exactly.
 ///  4. The save tries file URLs first, then Data as a fallback, and
 ///     logs both results. The working open-source recipe (glitter-live)
 ///     saves with file URLs — and that combination, file URLs + the
@@ -622,6 +634,17 @@ extension LivePhotoSaver {
             // and Photos' converter rejected it (3300). Level 4.1
             // allows 8192 macroblocks and matches what the iPhone
             // camera writes for 1080p video.
+            // NO B-frames (AllowFrameReordering false): with B-frames
+            // the encoder wrote a ctts version 0 table containing
+            // NEGATIVE composition offsets (-23/-22 ticks, stored as
+            // 4294967273/4294967274 — unsigned 32-bit), so any strict
+            // reader sees frames scheduled ~71 million seconds in the
+            // future and the video is invalid (this is what Photos'
+            // validator rejected with 3302 in run #41, after the
+            // still was verified correct). The source clip's own
+            // ctts has only positive offsets — the negative ones were
+            // introduced by our re-encode. Without B-frames there is
+            // no reordering and no ctts at all.
             videoSettings = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: width,
@@ -631,6 +654,7 @@ extension LivePhotoSaver {
                     AVVideoAverageBitRateKey: 8_000_000,
                     AVVideoExpectedSourceFrameRateKey: 30,
                     AVVideoMaxKeyFrameIntervalKey: 30,
+                    AVVideoAllowFrameReorderingKey: false,
                 ],
             ]
         }
