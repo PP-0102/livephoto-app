@@ -195,7 +195,8 @@ struct DouyinResolver {
                     imageURL: imageURL,
                     fallbackURL: fallbackURL,
                     width: width,
-                    height: height
+                    height: height,
+                    livePhotoClipURL: nil
                 ))
             }
         }

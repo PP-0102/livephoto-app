@@ -15,6 +15,14 @@ final class ImageViewModel: ObservableObject {
     @Published var savingIDs: Set<String> = []
     @Published var isVideoSaved = false
     @Published var isVideoSaving = false
+    @Published var liveSavedIDs: Set<String> = []
+    @Published var liveSavingIDs: Set<String> = []
+    @Published var isSavingAllLive = false
+
+    /// The items in this note that are Live Photos (have a motion clip).
+    var liveItems: [ImageItem] {
+        items.filter { $0.livePhotoClipURL != nil }
+    }
 
     /// Parse the pasted link and list the images (and video) in the note.
     /// Douyin links go to the Douyin resolver; everything else goes to
@@ -29,6 +37,8 @@ final class ImageViewModel: ObservableObject {
         items = []
         video = nil
         savedIDs = []
+        liveSavedIDs = []
+        liveSavingIDs = []
         isVideoSaved = false
         status = "正在解析…"
         do {
@@ -46,10 +56,79 @@ final class ImageViewModel: ObservableObject {
             } else {
                 status = "找到 \(items.count) 张图片"
             }
+            let liveCount = liveItems.count
+            if liveCount > 0 {
+                status += "（其中 \(liveCount) 张是实况）"
+            }
         } catch {
             status = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
         isParsing = false
+    }
+
+    /// Save one Live Photo to the Photos library as a real Live Photo.
+    /// If the Live Photo save fails, fall back to saving the still as a
+    /// static photo so the image is not lost.
+    func saveLivePhoto(item: ImageItem) async {
+        guard item.livePhotoClipURL != nil,
+              !liveSavedIDs.contains(item.id), !liveSavingIDs.contains(item.id) else { return }
+        liveSavingIDs.insert(item.id)
+        do {
+            guard await LivePhotoSaver.requestAccess() else {
+                status = LivePhotoError.photoAccessDenied.errorDescription ?? "没有相册权限"
+                liveSavingIDs.remove(item.id)
+                return
+            }
+            try await LivePhotoSaver.saveLivePhoto(item: item)
+            liveSavedIDs.insert(item.id)
+            status = "实况已保存 \(liveSavedIDs.count)/\(liveItems.count)"
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            status = "第 \(item.id) 张实况保存失败（\(reason)），已改为保存静态图片"
+            // Fallback: save the still as a plain photo.
+            do {
+                try await ImageSaver.saveImage(item: item)
+                savedIDs.insert(item.id)
+                status = "第 \(item.id) 张实况保存失败（\(reason)），已保存为静态图片"
+            } catch {
+                status = "第 \(item.id) 张保存失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            }
+        }
+        liveSavingIDs.remove(item.id)
+    }
+
+    /// Save every Live Photo in the list, one after another.
+    /// Items that fail as Live Photos fall back to static photos.
+    func saveAllLivePhotos() async {
+        let live = liveItems.filter { !liveSavedIDs.contains($0.id) }
+        guard !live.isEmpty, !isSavingAllLive else { return }
+        guard await LivePhotoSaver.requestAccess() else {
+            status = LivePhotoError.photoAccessDenied.errorDescription ?? "没有相册权限"
+            return
+        }
+        isSavingAllLive = true
+        var count = liveSavedIDs.count
+        for item in live {
+            do {
+                try await LivePhotoSaver.saveLivePhoto(item: item)
+                liveSavedIDs.insert(item.id)
+                count += 1
+                status = "实况已保存 \(count)/\(liveItems.count)"
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                status = "第 \(item.id) 张实况保存失败（\(reason)），已改为保存静态图片"
+                do {
+                    try await ImageSaver.saveImage(item: item)
+                    savedIDs.insert(item.id)
+                } catch {
+                    status = "第 \(item.id) 张保存失败，已跳过（已保存实况 \(count)/\(liveItems.count)）"
+                }
+            }
+        }
+        isSavingAllLive = false
+        if liveSavedIDs.count == liveItems.count {
+            status = "实况全部保存完成，共 \(liveItems.count) 张"
+        }
     }
 
     /// Save the video to the Photos library.
@@ -91,6 +170,7 @@ final class ImageViewModel: ObservableObject {
     }
 
     /// Save every image in the list, one after another.
+    /// Items already saved as Live Photos are skipped (no duplicate).
     func saveAll() async {
         guard !items.isEmpty, !isSavingAll else { return }
         guard await ImageSaver.requestAccess() else {
@@ -99,7 +179,7 @@ final class ImageViewModel: ObservableObject {
         }
         isSavingAll = true
         var count = savedIDs.count
-        for item in items where !savedIDs.contains(item.id) {
+        for item in items where !savedIDs.contains(item.id) && !liveSavedIDs.contains(item.id) {
             do {
                 try await ImageSaver.saveImage(item: item)
                 savedIDs.insert(item.id)
@@ -132,20 +212,27 @@ final class ImageViewModel: ObservableObject {
         status = ""
         savedIDs = []
         savingIDs = []
+        liveSavedIDs = []
+        liveSavingIDs = []
         isVideoSaved = false
         isVideoSaving = false
+        isSavingAllLive = false
     }
 
     /// One-tap download: parse the link (if not parsed yet) and save the
-    /// video and every image to the Photos library.
+    /// video and every image to the Photos library. Live Photos are saved
+    /// as real Live Photos; ordinary images are saved as static photos.
     func downloadAll() async {
-        guard !isParsing, !isSavingAll else { return }
+        guard !isParsing, !isSavingAll, !isSavingAllLive else { return }
         if items.isEmpty && video == nil {
             await parse()
         }
         guard !items.isEmpty || video != nil else { return }
         if video != nil {
             await saveVideo()
+        }
+        if !liveItems.isEmpty {
+            await saveAllLivePhotos()
         }
         await saveAll()
     }
@@ -248,14 +335,33 @@ struct ContentView: View {
                     .disabled(viewModel.isSavingAll)
                 }
 
+                // Save all Live Photos (only when the note has any)
+                if !viewModel.liveItems.isEmpty {
+                    Button(action: {
+                        linkFieldFocused = false
+                        Task { await viewModel.saveAllLivePhotos() }
+                    }) {
+                        Text(viewModel.isSavingAllLive ? "正在保存实况…" : "全部保存为实况（\(viewModel.liveItems.count) 张）")
+                            .fontWeight(.semibold)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(viewModel.isSavingAllLive)
+                }
+
                 // Image list
                 List(viewModel.items) { item in
                     ImageRow(
                         item: item,
                         isSaved: viewModel.savedIDs.contains(item.id),
                         isSaving: viewModel.savingIDs.contains(item.id),
+                        isLiveSaved: viewModel.liveSavedIDs.contains(item.id),
+                        isLiveSaving: viewModel.liveSavingIDs.contains(item.id),
                         onSave: {
                             Task { await viewModel.save(item: item) }
+                        },
+                        onSaveLive: {
+                            Task { await viewModel.saveLivePhoto(item: item) }
                         }
                     )
                 }
@@ -351,7 +457,10 @@ struct ImageRow: View {
     let item: ImageItem
     let isSaved: Bool
     let isSaving: Bool
+    let isLiveSaved: Bool
+    let isLiveSaving: Bool
     let onSave: () -> Void
+    let onSaveLive: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -374,19 +483,49 @@ struct ImageRow: View {
             .cornerRadius(8)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("图片 \(item.id)")
-                    .font(.headline)
+                HStack(spacing: 6) {
+                    Text("图片 \(item.id)")
+                        .font(.headline)
+                    if item.livePhotoClipURL != nil {
+                        Text("实况")
+                            .font(.caption2)
+                            .fontWeight(.bold)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.2))
+                            .foregroundColor(.orange)
+                            .cornerRadius(4)
+                    }
+                }
                 if item.width > 0 && item.height > 0 {
                     Text("\(item.width) × \(item.height)")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
-                Text(isSaved ? "已保存到相册" : "")
+                Text(isLiveSaved ? "实况已保存到相册" : (isSaved ? "已保存到相册" : ""))
                     .font(.caption)
-                    .foregroundColor(isSaved ? .green : .secondary)
+                    .foregroundColor(isLiveSaved || isSaved ? .green : .secondary)
             }
 
             Spacer()
+
+            // Save as Live Photo (only for Live Photo items).
+            if item.livePhotoClipURL != nil {
+                Button(action: onSaveLive) {
+                    if isLiveSaving {
+                        ProgressView()
+                    } else if isLiveSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    } else {
+                        Text("保存实况")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isLiveSaved || isLiveSaving)
+            }
 
             Button(action: onSave) {
                 if isSaving {

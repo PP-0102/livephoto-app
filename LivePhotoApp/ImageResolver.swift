@@ -9,6 +9,10 @@ struct ImageItem: Identifiable {
     let fallbackURL: URL    // 1080px web version (urlDefault), used if the original fails
     let width: Int
     let height: Int
+    /// Motion clip for a Live Photo (imageList[].livePhoto == true).
+    /// nil for ordinary static images. The clip is the ~2s mp4 at
+    /// imageList[].stream.h264[0].masterUrl.
+    let livePhotoClipURL: URL?
 }
 
 /// One video found inside a Xiaohongshu note (a video note has one).
@@ -162,12 +166,21 @@ struct ImageResolver {
                 let imageURL = originalURL(from: imageString) ?? fallbackURL
                 let width = (image["width"] as? NSNumber)?.intValue ?? 0
                 let height = (image["height"] as? NSNumber)?.intValue ?? 0
+                // Live Photo: the motion clip lives in this image's own
+                // stream (imageList[].stream.h264[0].masterUrl, ~2s mp4).
+                let livePhotoClipURL: URL?
+                if (image["livePhoto"] as? Bool) == true {
+                    livePhotoClipURL = bestStreamURL(from: image["stream"])
+                } else {
+                    livePhotoClipURL = nil
+                }
                 items.append(ImageItem(
                     id: "\(offset + 1)",
                     imageURL: imageURL,
                     fallbackURL: fallbackURL,
                     width: width,
-                    height: height
+                    height: height,
+                    livePhotoClipURL: livePhotoClipURL
                 ))
             }
         }
@@ -183,29 +196,8 @@ struct ImageResolver {
         guard let video = note["video"] as? [String: Any] else { return nil }
         let media = video["media"] as? [String: Any]
 
-        // Collect stream URLs: stream can be an array, or an object keyed
-        // by codec ({h264: [...], h265: [...]}). Prefer the largest.
-        var streams: [(url: String, width: Int, height: Int)] = []
-        if let rawStream = media?["stream"] {
-            var list: [[String: Any]] = []
-            if let arr = rawStream as? [[String: Any]] {
-                list = arr
-            } else if let dict = rawStream as? [String: Any] {
-                for value in dict.values {
-                    if let arr = value as? [[String: Any]] { list += arr }
-                }
-            }
-            for s in list {
-                let url = (s["masterUrl"] as? String)
-                    ?? (s["backupUrls"] as? [String])?.first
-                guard let url, !url.isEmpty else { continue }
-                streams.append((
-                    url: url,
-                    width: (s["width"] as? NSNumber)?.intValue ?? 0,
-                    height: (s["height"] as? NSNumber)?.intValue ?? 0
-                ))
-            }
-        }
+        // Stream URLs, largest first.
+        var streams = collectStreamURLs(from: media?["stream"])
         streams.sort { ($0.width * $0.height) > ($1.width * $1.height) }
 
         // Original: consumer.originVideoKey -> sns-video-bd.
@@ -223,6 +215,42 @@ struct ImageResolver {
         }
         let videoURL = originURL ?? fallbackURL
         return makeVideoItem(note: note, media: media, videoURL: videoURL, fallbackURL: fallbackURL)
+    }
+
+    /// Collect stream URLs from a `stream` value, which can be an array
+    /// or an object keyed by codec ({h264: [...], h265: [...]}). Each
+    /// entry gives its masterUrl (or first backup URL) and dimensions.
+    private static func collectStreamURLs(from rawStream: Any?) -> [(url: String, width: Int, height: Int)] {
+        var streams: [(url: String, width: Int, height: Int)] = []
+        guard let rawStream else { return streams }
+        var list: [[String: Any]] = []
+        if let arr = rawStream as? [[String: Any]] {
+            list = arr
+        } else if let dict = rawStream as? [String: Any] {
+            for value in dict.values {
+                if let arr = value as? [[String: Any]] { list += arr }
+            }
+        }
+        for s in list {
+            let url = (s["masterUrl"] as? String)
+                ?? (s["backupUrls"] as? [String])?.first
+            guard let url, !url.isEmpty else { continue }
+            streams.append((
+                url: url,
+                width: (s["width"] as? NSNumber)?.intValue ?? 0,
+                height: (s["height"] as? NSNumber)?.intValue ?? 0
+            ))
+        }
+        return streams
+    }
+
+    /// The best stream URL from a `stream` value (largest first), or nil
+    /// when there is no usable stream. Used for Live Photo motion clips.
+    private static func bestStreamURL(from rawStream: Any?) -> URL? {
+        var streams = collectStreamURLs(from: rawStream)
+        streams.sort { ($0.width * $0.height) > ($1.width * $1.height) }
+        guard let first = streams.first else { return nil }
+        return URL(string: httpsURL(first.url))
     }
 
     private static func makeVideoItem(
