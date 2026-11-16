@@ -246,29 +246,67 @@ struct LivePhotoSaver {
     }
 
     /// Full APP1 segment bytes (FF E1 marker + length + "Exif\0\0" + TIFF).
-    /// TIFF is little-endian, IFD0 has Orientation + MakerNote.
+    /// TIFF is little-endian. The MakerNote MUST live in the Exif
+    /// sub-IFD (IFD0 -> tag 0x8769 ExifOffset -> Exif IFD -> tag 0x927C),
+    /// exactly as a real iPhone JPEG does, and IFD0 must carry
+    /// Make "Apple" so parsers interpret the note as Apple's binary
+    /// plist. The previous build put the MakerNote directly in IFD0
+    /// with no Make tag: the bytes were valid (the binary plist parsed
+    /// back to {17: uuid}), but exiftool reported it as "Unrecognized
+    /// MakerNotes" and Photos could not read the content identifier
+    /// from the still at all — so the still and the clip never paired,
+    /// and every Live Photo save failed with 3300.
     private static func buildEXIFSegment(contentIdentifier: String,
                                          orientation: Int) -> Data {
         let plist = makerNotePlist(contentIdentifier: contentIdentifier)
+        let makeData = Data("Apple\0".utf8)    // 6 bytes, stored out of line
+        let modelData = Data("iPhone\0".utf8)  // 7 bytes, stored out of line
+        // Layout (offsets from TIFF start):
+        // header 8; IFD0 at 8 with 4 entries (2 + 48 + 4 = 54) -> ends 62;
+        // Exif IFD at 62 with 1 entry (2 + 12 + 4 = 18) -> ends 80;
+        // MakerNote data at 80; Make string after it; Model string last.
+        let exifIFDOffset = UInt32(8 + 2 + 4 * 12 + 4)
+        let makerNoteOffset = exifIFDOffset + UInt32(2 + 12 + 4)
+        let makeOffset = makerNoteOffset + UInt32(plist.count)
+        let modelOffset = makeOffset + UInt32(makeData.count)
         var tiff = Data()
         tiff.append(contentsOf: [0x49, 0x49])              // "II" little-endian
         tiff.append(contentsOf: [0x2A, 0x00])              // magic 42
         appendLE32(8, to: &tiff)                           // IFD0 offset
-        let ifdSize = 2 + 2 * 12 + 4
-        let makerOffset = UInt32(8 + ifdSize)              // offset from TIFF start
-        appendLE16(2, to: &tiff)                           // 2 entries
+        // IFD0: 4 entries.
+        appendLE16(4, to: &tiff)
         // Orientation: tag 0x0112, type SHORT(3), count 1, value inline.
         appendLE16(0x0112, to: &tiff)
         appendLE16(3, to: &tiff)
         appendLE32(1, to: &tiff)
         appendLE32(UInt32(orientation), to: &tiff)
+        // Make: tag 0x010F, type ASCII(2), count 6, value = offset.
+        appendLE16(0x010F, to: &tiff)
+        appendLE16(2, to: &tiff)
+        appendLE32(UInt32(makeData.count), to: &tiff)
+        appendLE32(makeOffset, to: &tiff)
+        // Model: tag 0x0110, type ASCII(2), count 7, value = offset.
+        appendLE16(0x0110, to: &tiff)
+        appendLE16(2, to: &tiff)
+        appendLE32(UInt32(modelData.count), to: &tiff)
+        appendLE32(modelOffset, to: &tiff)
+        // ExifOffset: tag 0x8769, type LONG(4), count 1, value = Exif IFD offset.
+        appendLE16(0x8769, to: &tiff)
+        appendLE16(4, to: &tiff)
+        appendLE32(1, to: &tiff)
+        appendLE32(exifIFDOffset, to: &tiff)
+        appendLE32(0, to: &tiff)                           // next IFD = 0
+        // Exif IFD: 1 entry.
+        appendLE16(1, to: &tiff)
         // MakerNote: tag 0x927C, type UNDEFINED(7), count=len, value=offset.
         appendLE16(0x927C, to: &tiff)
         appendLE16(7, to: &tiff)
         appendLE32(UInt32(plist.count), to: &tiff)
-        appendLE32(makerOffset, to: &tiff)
+        appendLE32(makerNoteOffset, to: &tiff)
         appendLE32(0, to: &tiff)                           // next IFD = 0
         tiff.append(plist)
+        tiff.append(makeData)
+        tiff.append(modelData)
         var payload = Data()
         payload.append(contentsOf: [0x45, 0x78, 0x69, 0x66, 0x00, 0x00])  // "Exif\0\0"
         payload.append(tiff)
