@@ -58,16 +58,19 @@ enum LivePhotoError: LocalizedError {
 ///     tracks were built from are the prime suspect for 3300 on iOS 15.1:
 ///     Photos' video converter has to process every track, and plain
 ///     Photos only needs the shared identifier to pair still + video.
-///  3. H.264 High 4.1 (the "Most Compatible" format), HEVC only as a
-///     fallback if H.264 encoding fails on the device. The H.264
-///     profile/level MUST fit the frame: the source clip is 1080x1440
-///     High 5.0, and Main 3.1 (used in an earlier build) caps at
-///     3600 macroblocks — a 1080x1440 frame is 6075, so that re-encode
-///     was non-conformant and Photos' converter rejected it with 3300
-///     (confirmed on the VM: libx264 reports "frame MB size (68x90) >
-///     level limit (3600)"). High 4.1 is used instead.
-///  4. The save passes both files as Data. File URLs were tried in
-///     every build and always failed with -1, so they are not attempted.
+///  3. The motion clip is NOT re-encoded: it is remuxed straight from
+///     the downloaded .mp4 into a .mov (AVAssetExportSession
+///     Passthrough), so the video stream is the genuine phone-recorded
+///     H.264 bitstream, untouched. The re-encode (AVAssetWriter H.264
+///     High 4.1 / HEVC) is only a fallback if the remux fails. Reason:
+///     run #38's log showed Photos spending ~8s per photo on the Data
+///     save before failing with 3300 (videoConversionFailed) — i.e. it
+///     was actually trying to convert our re-encoded video and failing.
+///     The re-encode is therefore the prime suspect now, and the
+///     cleanest test is to hand Photos the original bitstream.
+///  4. The save passes both files as Data. File URLs were tried in run
+///     #38 with the fixed still and still failed with -1 every time,
+///     so they are not attempted.
 ///  5. makeLivpData() exports the exact same pair as a .livp file, so
 ///     the bytes the app produces can be inspected when the direct
 ///     save still fails.
@@ -506,67 +509,28 @@ struct LivePhotoSaver {
 
     // MARK: - Save to Photos
 
-    /// Save the still + clip as one Live Photo asset.
-    ///
-    /// Tries file URLs first, then Data as a fallback, and logs both
-    /// results. Why this order: file URLs were tried in every earlier
-    /// build and always failed with PHPhotosErrorDomain -1 (Photos
-    /// could not validate the shared content identifier from file
-    /// URLs) — BUT every one of those attempts used the broken still
-    /// whose MakerNote sat directly in IFD0 with no Make tag, so Photos
-    /// could not read the still's identifier at all. The still is
-    /// fixed now (MakerNote in the Exif sub-IFD, Make "Apple"), so
-    /// file URLs have never been tried with a readable still and may
-    /// work now. Data has failed with 3300 in every build so far, so
-    /// it is only the fallback; if both fail, the Data error is
-    /// reported and both errors stay in the log.
+    /// Save the still + clip as one Live Photo asset, passing both
+    /// files as Data. File URLs were tried in run #38 with the fixed
+    /// still (MakerNote in the Exif sub-IFD, Make "Apple") and still
+    /// failed with PHPhotosErrorDomain -1 every time, so they are not
+    /// attempted. The temp files are read here and can be removed by
+    /// the caller afterwards.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        LivePhotoLog.shared.append("正在保存到相册（文件方式）…")
+        let jpgData: Data
+        let movData: Data
         do {
-            try await performSaveOnce(jpgURL: jpgURL, movURL: movURL, asData: false)
-            LivePhotoLog.shared.append("相册保存成功（文件方式）✓")
-            return
-        } catch let fileError as LivePhotoError {
-            LivePhotoLog.shared.append("文件方式失败：\(fileError.localizedDescription)")
-            LivePhotoLog.shared.append("改用数据方式重试…")
-            do {
-                try await performSaveOnce(jpgURL: jpgURL, movURL: movURL, asData: true)
-                LivePhotoLog.shared.append("相册保存成功（数据方式）✓")
-                return
-            } catch let dataError as LivePhotoError {
-                LivePhotoLog.shared.append("数据方式也失败：\(dataError.localizedDescription)")
-                throw dataError
-            }
+            jpgData = try Data(contentsOf: jpgURL)
+            movData = try Data(contentsOf: movURL)
+        } catch {
+            LivePhotoLog.shared.append("读取照片/视频文件失败")
+            throw LivePhotoError.saveFailed
         }
-    }
-
-    /// One attempt to save the pair, either as file URLs or as Data.
-    private static func performSaveOnce(jpgURL: URL, movURL: URL, asData: Bool) async throws {
-        let jpgData: Data?
-        let movData: Data?
-        if asData {
-            do {
-                jpgData = try Data(contentsOf: jpgURL)
-                movData = try Data(contentsOf: movURL)
-            } catch {
-                LivePhotoLog.shared.append("读取照片/视频文件失败")
-                throw LivePhotoError.saveFailed
-            }
-            LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData!.count / 1024) KB + 视频 \(movData!.count / 1024) KB）…")
-        } else {
-            jpgData = nil
-            movData = nil
-        }
+        LivePhotoLog.shared.append("正在保存到相册（照片 \(jpgData.count / 1024) KB + 视频 \(movData.count / 1024) KB）…")
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                if asData {
-                    request.addResource(with: .photo, data: jpgData!, options: nil)
-                    request.addResource(with: .pairedVideo, data: movData!, options: nil)
-                } else {
-                    request.addResource(with: .photo, fileURL: jpgURL, options: nil)
-                    request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
-                }
+                request.addResource(with: .photo, data: jpgData, options: nil)
+                request.addResource(with: .pairedVideo, data: movData, options: nil)
             }, completionHandler: { success, error in
                 if let error = error as NSError? {
                     LivePhotoLog.shared.append("相册保存失败：\(error.domain) \(error.code)：\(error.localizedDescription)")
@@ -574,6 +538,7 @@ struct LivePhotoSaver {
                         domain: error.domain, code: error.code,
                         message: error.localizedDescription))
                 } else if success {
+                    LivePhotoLog.shared.append("相册保存成功 ✓")
                     continuation.resume()
                 } else {
                     LivePhotoLog.shared.append("相册保存失败（无错误信息）")
@@ -589,29 +554,76 @@ struct LivePhotoSaver {
 extension LivePhotoSaver {
 
     /// Transcode the motion clip into a Live Photo .mov.
-    /// Tries H.264 first (the most widely accepted format — what the
-    /// iPhone writes in "Most Compatible" mode); falls back to HEVC if
-    /// H.264 fails on the device.
+    ///
+    /// First tries a straight remux (AVAssetExportSession Passthrough):
+    /// the source clip is already a genuine phone-recorded H.264 video,
+    /// so re-encoding it only adds risk — the re-encode's output is the
+    /// prime suspect for the 3300 (videoConversionFailed) Photos kept
+    /// returning after ~8s of conversion work in run #38. Passthrough
+    /// copies the video stream untouched into a .mov container and the
+    /// content identifier is then byte-injected (moov > meta) as usual.
+    /// Only if the remux fails on the device does it fall back to the
+    /// H.264 re-encode (and then HEVC).
     private static func transcodeLivePhotoVideo(inputURL: URL, outputURL: URL,
                                                 contentIdentifier: String) async throws {
-        LivePhotoLog.shared.append("开始转码视频（H.264）…")
+        LivePhotoLog.shared.append("开始处理视频（直接封装，不重新编码）…")
         do {
-            try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
-                                     contentIdentifier: contentIdentifier,
-                                     codec: .h264)
-            LivePhotoLog.shared.append("H.264 转码完成")
+            try await remuxPassthrough(inputURL: inputURL, outputURL: outputURL)
+            LivePhotoLog.shared.append("直接封装完成")
+            try injectMOVContentIdentifier(movURL: outputURL,
+                                           contentIdentifier: contentIdentifier)
         } catch {
-            // H.264 failed on this device; retry once with HEVC.
-            LivePhotoLog.shared.append("H.264 转码失败，改用 HEVC 重试")
+            // Remux failed on this device; fall back to the H.264 re-encode.
+            LivePhotoLog.shared.append("直接封装失败，改用 H.264 转码")
             try? FileManager.default.removeItem(at: outputURL)
             do {
                 try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                          contentIdentifier: contentIdentifier,
-                                         codec: .hevc)
-                LivePhotoLog.shared.append("HEVC 转码完成")
+                                         codec: .h264)
+                LivePhotoLog.shared.append("H.264 转码完成")
             } catch {
-                LivePhotoLog.shared.append("HEVC 转码也失败")
-                throw LivePhotoError.videoEncodeFailed
+                // H.264 failed on this device; retry once with HEVC.
+                LivePhotoLog.shared.append("H.264 转码失败，改用 HEVC 重试")
+                try? FileManager.default.removeItem(at: outputURL)
+                do {
+                    try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
+                                             contentIdentifier: contentIdentifier,
+                                             codec: .hevc)
+                    LivePhotoLog.shared.append("HEVC 转码完成")
+                } catch {
+                    LivePhotoLog.shared.append("HEVC 转码也失败")
+                    throw LivePhotoError.videoEncodeFailed
+                }
+            }
+        }
+    }
+
+    /// Remux the source .mp4 into a .mov container without re-encoding
+    /// (AVAssetExportSession Passthrough). The video stream is copied
+    /// bit-for-bit, so nothing about the encoding can be blamed on us.
+    private static func remuxPassthrough(inputURL: URL, outputURL: URL) async throws {
+        let asset = AVURLAsset(url: inputURL)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            throw LivePhotoError.noVideoTrack
+        }
+        let duration = videoTrack.timeRange.duration
+        guard duration > .zero else { throw LivePhotoError.noVideoTrack }
+        let naturalSize = videoTrack.naturalSize
+        LivePhotoLog.shared.append("原动图：\(Int(naturalSize.width))×\(Int(naturalSize.height))，时长 \(String(format: "%.2f", duration.seconds)) 秒，帧率 \(String(format: "%.1f", videoTrack.nominalFrameRate))")
+        guard let session = AVAssetExportSession(asset: asset,
+                                                 presetName: AVAssetExportPresetPassthrough) else {
+            throw LivePhotoError.videoEncodeFailed
+        }
+        session.outputURL = outputURL
+        session.outputFileType = .mov
+        session.shouldOptimizeForNetworkUse = false
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            session.exportAsynchronously {
+                if session.status == .completed {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: LivePhotoError.videoEncodeFailed)
+                }
             }
         }
     }
