@@ -45,29 +45,36 @@ enum LivePhotoError: LocalizedError {
 /// History: the standalone 实况下载 app (v1–v14) never got a save to work
 /// (errors -1 and 3300), and the first builds inside this app failed
 /// with 3300 too. What the current build does differently, and why:
-///  1. BOTH identifiers are written byte by byte (verified on the VM):
-///     the still's MakerNote lives in the Exif sub-IFD (IFD0 -> 0x8769
-///     -> Exif IFD -> 0x927C) with Make "Apple" — the earlier build put
-///     it directly in IFD0 with no Make tag, which Photos could not
-///     read at all; the clip's identifier is injected as a moov-level
-///     meta atom (iTunes/keys format, byte-identical in structure to
-///     an exiftool-written .livp .mov). The official `writer.metadata`
-///     API was used before and was never verified to land the
-///     identifier in the file, so it is no longer used.
+///  1. The still's content identifier is written by the system
+///     ImageIO writer (CGImageDestination with
+///     kCGImagePropertyMakerAppleDictionary ["17": uuid]), the same
+///     approach the open-source glitter-live app uses — NOT by
+///     hand-built EXIF bytes. The hand-built minimal EXIF (used
+///     through run #39) read back correctly in exiftool and in a
+///     Python parser, but was never verified to be readable by
+///     Photos' own ImageIO, and an unreadable still identifier
+///     would leave the pair unpaired (3300) no matter how correct
+///     the video is. The clip's identifier is still injected as a
+///     moov-level meta atom (iTunes/keys format, byte-identical in
+///     structure to an exiftool-written .livp .mov), because the
+///     official `writer.metadata` API was never verified to land
+///     the identifier in the file.
 ///  2. NO timed-metadata tracks. The iOS 17 camera reference values the
 ///     tracks were built from are the prime suspect for 3300 on iOS 15.1:
 ///     Photos' video converter has to process every track, and plain
 ///     Photos only needs the shared identifier to pair still + video.
-///  3. The motion clip is NOT re-encoded: it is remuxed straight from
-///     the downloaded .mp4 into a .mov (AVAssetExportSession
-///     Passthrough), so the video stream is the genuine phone-recorded
-///     H.264 bitstream, untouched. The re-encode (AVAssetWriter H.264
-///     High 4.1 / HEVC) is only a fallback if the remux fails. Reason:
-///     run #38's log showed Photos spending ~8s per photo on the Data
-///     save before failing with 3300 (videoConversionFailed) — i.e. it
-///     was actually trying to convert our re-encoded video and failing.
-///     The re-encode is therefore the prime suspect now, and the
-///     cleanest test is to hand Photos the original bitstream.
+///  3. H.264 High 4.1 (the "Most Compatible" format), HEVC only as a
+///     fallback if H.264 encoding fails on the device. The H.264
+///     profile/level MUST fit the frame: the source clip is 1080x1440
+///     High 5.0, and Main 3.1 (used in an earlier build) caps at
+///     3600 macroblocks — a 1080x1440 frame is 6075, so that re-encode
+///     was non-conformant and Photos' converter rejected it with 3300
+///     (confirmed on the VM: libx264 reports "frame MB size (68x90) >
+///     level limit (3600)"). High 4.1 is used instead. A straight
+///     remux (Passthrough, no re-encode) was tried in run #39 and was
+///     WORSE: Photos rejected the untouched original bitstream
+///     instantly (3300 in 2–50 ms), while the re-encoded video got as
+///     far as ~8s of conversion work in run #38.
 ///  4. The save passes both files as Data. File URLs were tried in run
 ///     #38 with the fixed still and still failed with -1 every time,
 ///     so they are not attempted.
@@ -237,7 +244,7 @@ struct LivePhotoSaver {
         do {
             try writeJPEG(image: image, cgImage: cgImage, to: jpgURL,
                           contentIdentifier: contentIdentifier)
-            LivePhotoLog.shared.append("照片已写入（MakerNote 在 Exif 子目录，Make=Apple）")
+            LivePhotoLog.shared.append("照片已写入（系统写入 MakerNote）")
             try await transcodeLivePhotoVideo(inputURL: mp4URL, outputURL: movURL,
                                               contentIdentifier: contentIdentifier)
             let movSize = (try? FileManager.default.attributesOfItem(atPath: movURL.path)[.size] as? Int) ?? 0
@@ -287,175 +294,37 @@ struct LivePhotoSaver {
     /// Write the still as a plain JPEG (no EXIF metadata), then inject the
     /// EXIF MakerNote carrying the content identifier at the byte level.
     /// Byte-level injection is used because CGImageDestination's MakerNote
-    /// metadata is not reliably written into the file, which left Photos
-    /// unable to pair the still with the clip (PHPhotosErrorDomain -1).
+    /// Write the still as a JPEG and tag it with the shared content
+    /// identifier, using the system ImageIO writer (CGImageDestination)
+    /// instead of hand-built EXIF bytes. The properties dictionary
+    /// carries the MakerNote in the official form —
+    /// `kCGImagePropertyMakerAppleDictionary: ["17": <uuid>]` — and
+    /// ImageIO writes the full EXIF itself (MakerNote as a binary
+    /// plist in the Exif sub-IFD, plus PixelXDimension/PixelYDimension
+    /// and the rest of the standard tags). This is the same approach
+    /// the open-source glitter-live app uses, and it is the form
+    /// Photos' own ImageIO is guaranteed to read. The previous builds
+    /// hand-built a minimal EXIF APP1 segment byte by byte: exiftool
+    /// and a Python parser read the MakerNote back correctly, but the
+    /// minimal structure (only Orientation/Make/Model/ExifOffset/
+    /// MakerNote) was never verified to be readable by Photos itself,
+    /// and an unreadable still identifier would leave the still and
+    /// the clip unpaired (3300) no matter how correct the video is.
     private static func writeJPEG(image: UIImage, cgImage: CGImage, to url: URL,
                                   contentIdentifier: String) throws {
         guard let dest = CGImageDestinationCreateWithURL(
             url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
             throw LivePhotoError.jpegEncodeFailed
         }
-        CGImageDestinationSetProperties(
-            dest, [kCGImageDestinationLossyCompressionQuality as String: 0.92] as CFDictionary)
-        CGImageDestinationAddImage(dest, cgImage, nil)
+        let properties: [String: Any] = [
+            kCGImageDestinationLossyCompressionQuality as String: 0.92,
+            kCGImagePropertyOrientation as String: exifOrientation(for: image.imageOrientation),
+            kCGImagePropertyMakerAppleDictionary as String: ["17": contentIdentifier],
+        ]
+        CGImageDestinationAddImage(dest, cgImage, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             throw LivePhotoError.jpegEncodeFailed
         }
-        try injectEXIFMakerNote(jpgURL: url, contentIdentifier: contentIdentifier,
-                                orientation: exifOrientation(for: image.imageOrientation))
-    }
-
-    /// Inject a minimal EXIF APP1 segment (little-endian TIFF) right after
-    /// the JPEG SOI marker. Contains Orientation + MakerNote (binary plist
-    /// {17: <uuid>}). Any pre-existing EXIF APP1 segment is stripped first
-    /// so the file never ends up with two.
-    private static func injectEXIFMakerNote(jpgURL: URL, contentIdentifier: String,
-                                            orientation: Int) throws {
-        var data: Data
-        do {
-            data = try Data(contentsOf: jpgURL)
-        } catch {
-            throw LivePhotoError.jpegEncodeFailed
-        }
-        guard data.count >= 2, data[0] == 0xFF, data[1] == 0xD8 else {
-            throw LivePhotoError.jpegEncodeFailed
-        }
-        // Strip any existing APP1/Exif segment, keep everything else.
-        // Stop at SOS (0xDA): after it comes compressed scan data, which
-        // can contain 0xFF bytes that are not segment markers, so the rest
-        // of the file (SOS header + scan + EOI) is copied verbatim.
-        var body = Data()
-        var pos = 2
-        while pos < data.count {
-            if data[pos] != 0xFF {
-                body.append(data[pos...])
-                break
-            }
-            let marker = data[pos + 1]
-            if marker == 0xD8 || marker == 0xD9 || marker == 0xDA
-                || (0xD0...0xD7).contains(marker) {
-                body.append(data[pos...])
-                break
-            }
-            guard pos + 4 <= data.count else { break }
-            let segLen = Int(readBE16(data, at: pos + 2))
-            guard segLen >= 2, pos + 2 + segLen <= data.count else { break }
-            let isExif = marker == 0xE1 && segLen >= 8
-                && data[pos + 4] == 0x45 && data[pos + 5] == 0x78
-                && data[pos + 6] == 0x69 && data[pos + 7] == 0x66
-            if !isExif {
-                body.append(data[pos..<(pos + 2 + segLen)])
-            }
-            pos += 2 + segLen
-        }
-        let exifSeg = buildEXIFSegment(contentIdentifier: contentIdentifier,
-                                       orientation: orientation)
-        var out = Data()
-        out.append(contentsOf: [0xFF, 0xD8])
-        out.append(exifSeg)
-        out.append(body)
-        do {
-            try out.write(to: jpgURL, options: [.atomic])
-        } catch {
-            throw LivePhotoError.jpegEncodeFailed
-        }
-    }
-
-    /// Full APP1 segment bytes (FF E1 marker + length + "Exif\0\0" + TIFF).
-    /// TIFF is little-endian. The MakerNote MUST live in the Exif
-    /// sub-IFD (IFD0 -> tag 0x8769 ExifOffset -> Exif IFD -> tag 0x927C),
-    /// exactly as a real iPhone JPEG does, and IFD0 must carry
-    /// Make "Apple" so parsers interpret the note as Apple's binary
-    /// plist. The previous build put the MakerNote directly in IFD0
-    /// with no Make tag: the bytes were valid (the binary plist parsed
-    /// back to {17: uuid}), but exiftool reported it as "Unrecognized
-    /// MakerNotes" and Photos could not read the content identifier
-    /// from the still at all — so the still and the clip never paired,
-    /// and every Live Photo save failed with 3300.
-    private static func buildEXIFSegment(contentIdentifier: String,
-                                         orientation: Int) -> Data {
-        let plist = makerNotePlist(contentIdentifier: contentIdentifier)
-        let makeData = Data("Apple\0".utf8)    // 6 bytes, stored out of line
-        let modelData = Data("iPhone\0".utf8)  // 7 bytes, stored out of line
-        // Layout (offsets from TIFF start):
-        // header 8; IFD0 at 8 with 4 entries (2 + 48 + 4 = 54) -> ends 62;
-        // Exif IFD at 62 with 1 entry (2 + 12 + 4 = 18) -> ends 80;
-        // MakerNote data at 80; Make string after it; Model string last.
-        // (Plain literals: the compiler times out type-checking the
-        // arithmetic inside UInt32(...). Values verified by hand.)
-        let exifIFDOffset: UInt32 = 62
-        let makerNoteOffset: UInt32 = 80
-        let makeOffset = makerNoteOffset + UInt32(plist.count)
-        let modelOffset = makeOffset + UInt32(makeData.count)
-        var tiff = Data()
-        tiff.append(contentsOf: [0x49, 0x49])              // "II" little-endian
-        tiff.append(contentsOf: [0x2A, 0x00])              // magic 42
-        appendLE32(8, to: &tiff)                           // IFD0 offset
-        // IFD0: 4 entries.
-        appendLE16(4, to: &tiff)
-        // Orientation: tag 0x0112, type SHORT(3), count 1, value inline.
-        appendLE16(0x0112, to: &tiff)
-        appendLE16(3, to: &tiff)
-        appendLE32(1, to: &tiff)
-        appendLE32(UInt32(orientation), to: &tiff)
-        // Make: tag 0x010F, type ASCII(2), count 6, value = offset.
-        appendLE16(0x010F, to: &tiff)
-        appendLE16(2, to: &tiff)
-        appendLE32(UInt32(makeData.count), to: &tiff)
-        appendLE32(makeOffset, to: &tiff)
-        // Model: tag 0x0110, type ASCII(2), count 7, value = offset.
-        appendLE16(0x0110, to: &tiff)
-        appendLE16(2, to: &tiff)
-        appendLE32(UInt32(modelData.count), to: &tiff)
-        appendLE32(modelOffset, to: &tiff)
-        // ExifOffset: tag 0x8769, type LONG(4), count 1, value = Exif IFD offset.
-        appendLE16(0x8769, to: &tiff)
-        appendLE16(4, to: &tiff)
-        appendLE32(1, to: &tiff)
-        appendLE32(exifIFDOffset, to: &tiff)
-        appendLE32(0, to: &tiff)                           // next IFD = 0
-        // Exif IFD: 1 entry.
-        appendLE16(1, to: &tiff)
-        // MakerNote: tag 0x927C, type UNDEFINED(7), count=len, value=offset.
-        appendLE16(0x927C, to: &tiff)
-        appendLE16(7, to: &tiff)
-        appendLE32(UInt32(plist.count), to: &tiff)
-        appendLE32(makerNoteOffset, to: &tiff)
-        appendLE32(0, to: &tiff)                           // next IFD = 0
-        tiff.append(plist)
-        tiff.append(makeData)
-        tiff.append(modelData)
-        var payload = Data()
-        payload.append(contentsOf: [0x45, 0x78, 0x69, 0x66, 0x00, 0x00])  // "Exif\0\0"
-        payload.append(tiff)
-        var seg = Data()
-        seg.append(contentsOf: [0xFF, 0xE1])
-        appendBE16(UInt16(payload.count + 2), to: &seg)    // length incl. itself
-        seg.append(payload)
-        return seg
-    }
-
-    /// Binary plist {17: <uuid>} for the JPEG MakerNote. Built byte by byte
-    /// because PropertyListSerialization refuses integer dictionary keys.
-    private static func makerNotePlist(contentIdentifier: String) -> Data {
-        let uuidData = contentIdentifier.data(using: .ascii) ?? Data()
-        var data = Data()
-        data.append(contentsOf: [UInt8]("bplist00".utf8))
-        data.append(contentsOf: [0xD1, 0x01, 0x02])   // dict, 1 entry
-        data.append(contentsOf: [0x10, 0x11])         // int 17
-        data.append(contentsOf: [0x5F, 0x10, UInt8(uuidData.count)])  // ascii string
-        data.append(uuidData)
-        let off0 = 8
-        let off1 = off0 + 3
-        let off2 = off1 + 2
-        let offTab = off2 + 3 + uuidData.count
-        data.append(contentsOf: [UInt8(off0), UInt8(off1), UInt8(off2)])  // offset table
-        data.append(contentsOf: [UInt8](repeating: 0, count: 6))
-        data.append(contentsOf: [1, 1])
-        data.append(contentsOf: bigEndianBytes(UInt64(3)))       // object count
-        data.append(contentsOf: bigEndianBytes(UInt64(0)))       // top object
-        data.append(contentsOf: bigEndianBytes(UInt64(offTab)))  // offset table offset
-        return data
     }
 
     /// EXIF orientation (1-8) for a UIImage orientation.
@@ -475,11 +344,6 @@ struct LivePhotoSaver {
 
     // MARK: - Byte helpers (big/little-endian)
 
-    private static func appendBE16(_ value: UInt16, to data: inout Data) {
-        data.append(UInt8((value >> 8) & 0xFF))
-        data.append(UInt8(value & 0xFF))
-    }
-
     private static func appendBE32(_ value: UInt32, to data: inout Data) {
         data.append(UInt8((value >> 24) & 0xFF))
         data.append(UInt8((value >> 16) & 0xFF))
@@ -497,14 +361,6 @@ struct LivePhotoSaver {
         data.append(UInt8((value >> 8) & 0xFF))
         data.append(UInt8((value >> 16) & 0xFF))
         data.append(UInt8((value >> 24) & 0xFF))
-    }
-
-    private static func readBE16(_ data: Data, at offset: Int) -> UInt16 {
-        (UInt16(data[offset]) << 8) | UInt16(data[offset + 1])
-    }
-
-    private static func bigEndianBytes(_ value: UInt64) -> [UInt8] {
-        withUnsafeBytes(of: value.bigEndian, Array.init)
     }
 
     // MARK: - Save to Photos
@@ -554,76 +410,33 @@ struct LivePhotoSaver {
 extension LivePhotoSaver {
 
     /// Transcode the motion clip into a Live Photo .mov.
-    ///
-    /// First tries a straight remux (AVAssetExportSession Passthrough):
-    /// the source clip is already a genuine phone-recorded H.264 video,
-    /// so re-encoding it only adds risk — the re-encode's output is the
-    /// prime suspect for the 3300 (videoConversionFailed) Photos kept
-    /// returning after ~8s of conversion work in run #38. Passthrough
-    /// copies the video stream untouched into a .mov container and the
-    /// content identifier is then byte-injected (moov > meta) as usual.
-    /// Only if the remux fails on the device does it fall back to the
-    /// H.264 re-encode (and then HEVC).
+    /// Re-encodes with AVAssetWriter: H.264 High 4.1 first (the "Most
+    /// Compatible" format), HEVC as a fallback if H.264 fails on the
+    /// device. A straight remux (AVAssetExportSession Passthrough) was
+    /// tried in run #39: the untouched original bitstream was rejected
+    /// by Photos instantly (3300 in 2–50 ms), while the re-encoded
+    /// video got as far as ~8s of conversion work in run #38 — so the
+    /// re-encode is the better path and the remux is not used.
     private static func transcodeLivePhotoVideo(inputURL: URL, outputURL: URL,
                                                 contentIdentifier: String) async throws {
-        LivePhotoLog.shared.append("开始处理视频（直接封装，不重新编码）…")
+        LivePhotoLog.shared.append("开始转码视频（H.264）…")
         do {
-            try await remuxPassthrough(inputURL: inputURL, outputURL: outputURL)
-            LivePhotoLog.shared.append("直接封装完成")
-            try injectMOVContentIdentifier(movURL: outputURL,
-                                           contentIdentifier: contentIdentifier)
+            try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
+                                     contentIdentifier: contentIdentifier,
+                                     codec: .h264)
+            LivePhotoLog.shared.append("H.264 转码完成")
         } catch {
-            // Remux failed on this device; fall back to the H.264 re-encode.
-            LivePhotoLog.shared.append("直接封装失败，改用 H.264 转码")
+            // H.264 failed on this device; retry once with HEVC.
+            LivePhotoLog.shared.append("H.264 转码失败，改用 HEVC 重试")
             try? FileManager.default.removeItem(at: outputURL)
             do {
                 try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
                                          contentIdentifier: contentIdentifier,
-                                         codec: .h264)
-                LivePhotoLog.shared.append("H.264 转码完成")
+                                         codec: .hevc)
+                LivePhotoLog.shared.append("HEVC 转码完成")
             } catch {
-                // H.264 failed on this device; retry once with HEVC.
-                LivePhotoLog.shared.append("H.264 转码失败，改用 HEVC 重试")
-                try? FileManager.default.removeItem(at: outputURL)
-                do {
-                    try await transcodeVideo(inputURL: inputURL, outputURL: outputURL,
-                                             contentIdentifier: contentIdentifier,
-                                             codec: .hevc)
-                    LivePhotoLog.shared.append("HEVC 转码完成")
-                } catch {
-                    LivePhotoLog.shared.append("HEVC 转码也失败")
-                    throw LivePhotoError.videoEncodeFailed
-                }
-            }
-        }
-    }
-
-    /// Remux the source .mp4 into a .mov container without re-encoding
-    /// (AVAssetExportSession Passthrough). The video stream is copied
-    /// bit-for-bit, so nothing about the encoding can be blamed on us.
-    private static func remuxPassthrough(inputURL: URL, outputURL: URL) async throws {
-        let asset = AVURLAsset(url: inputURL)
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            throw LivePhotoError.noVideoTrack
-        }
-        let duration = videoTrack.timeRange.duration
-        guard duration > .zero else { throw LivePhotoError.noVideoTrack }
-        let naturalSize = videoTrack.naturalSize
-        LivePhotoLog.shared.append("原动图：\(Int(naturalSize.width))×\(Int(naturalSize.height))，时长 \(String(format: "%.2f", duration.seconds)) 秒，帧率 \(String(format: "%.1f", videoTrack.nominalFrameRate))")
-        guard let session = AVAssetExportSession(asset: asset,
-                                                 presetName: AVAssetExportPresetPassthrough) else {
-            throw LivePhotoError.videoEncodeFailed
-        }
-        session.outputURL = outputURL
-        session.outputFileType = .mov
-        session.shouldOptimizeForNetworkUse = false
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            session.exportAsynchronously {
-                if session.status == .completed {
-                    continuation.resume()
-                } else {
-                    continuation.resume(throwing: LivePhotoError.videoEncodeFailed)
-                }
+                LivePhotoLog.shared.append("HEVC 转码也失败")
+                throw LivePhotoError.videoEncodeFailed
             }
         }
     }
