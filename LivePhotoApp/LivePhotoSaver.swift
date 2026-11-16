@@ -55,10 +55,15 @@ enum LivePhotoError: LocalizedError {
 ///     Photos' video converter has to process every track, and plain
 ///     Photos only needs the shared identifier to pair still + video.
 ///  3. H.264 first (the "Most Compatible" format), HEVC only as a
-///     fallback if H.264 encoding fails on the device.
-///  4. The save itself tries file URLs first, then the same files as
-///     Data, and reports both errors when neither works (the two methods
-///     fail differently: -1 vs 3300).
+///     fallback if H.264 encoding fails on the device. The H.264
+///     profile/level MUST fit the frame: the source clip is 1080x1440
+///     High 5.0, and Main 3.1 (used in the previous build) caps at
+///     3600 macroblocks — a 1080x1440 frame is 6075, so that re-encode
+///     was non-conformant and Photos' converter rejected it with 3300
+///     (confirmed on the VM: libx264 reports "frame MB size (68x90) >
+///     level limit (3600)"). High 4.1 is used instead.
+///  4. The save passes both files as Data. File URLs were tried in
+///     every build and always failed with -1, so they are not attempted.
 ///  5. The still's MakerNote is written byte by byte (binary plist
 ///     {17: <uuid>}) — verified on the VM to parse back correctly, and
 ///     verified on a real file the old app exported.
@@ -348,60 +353,35 @@ struct LivePhotoSaver {
 
     // MARK: - Save to Photos
 
-    /// Save the still + clip as one Live Photo asset.
-    ///
-    /// Tries file URLs first, then the same files as Data. The two
-    /// methods fail differently on this device (file URLs gave -1,
-    /// Data gave 3300), and which one works depends on how Photos
-    /// reads the content identifier — so both are attempted, and both
-    /// errors are reported when neither works. The temp files must stay
-    /// in place until each attempt completes; the caller removes them
-    /// after this returns.
+    /// Save the still + clip as one Live Photo asset, passing both
+    /// files as Data. File URLs were tried in every build and always
+    /// failed with PHPhotosErrorDomain -1 (Photos cannot validate the
+    /// shared content identifier from file URLs), so only Data is used.
+    /// The temp files are read here and can be removed by the caller
+    /// afterwards.
     private static func performSave(jpgURL: URL, movURL: URL) async throws {
-        // Attempt 1: file URLs.
-        if let fileError = await attemptSave(jpgURL: jpgURL, movURL: movURL, useFileURLs: true) {
-            // Attempt 2: the same files as Data.
-            if let dataError = await attemptSave(jpgURL: jpgURL, movURL: movURL, useFileURLs: false) {
-                throw LivePhotoError.photosError(
-                    domain: dataError.domain, code: dataError.code,
-                    message: "文件方式：\(fileError.localizedDescription)；数据方式：\(dataError.localizedDescription)")
-            }
+        let jpgData: Data
+        let movData: Data
+        do {
+            jpgData = try Data(contentsOf: jpgURL)
+            movData = try Data(contentsOf: movURL)
+        } catch {
+            throw LivePhotoError.saveFailed
         }
-    }
-
-    /// One performChanges attempt. Returns the error, or nil on success.
-    private static func attemptSave(jpgURL: URL, movURL: URL, useFileURLs: Bool) async -> NSError? {
-        let jpgData: Data?
-        let movData: Data?
-        if useFileURLs {
-            jpgData = nil
-            movData = nil
-        } else {
-            do {
-                jpgData = try Data(contentsOf: jpgURL)
-                movData = try Data(contentsOf: movURL)
-            } catch {
-                return NSError(domain: "LivePhotoSaver", code: -1,
-                               userInfo: [NSLocalizedDescriptionKey: "读取临时文件失败"])
-            }
-        }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<NSError?, Never>) in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                if useFileURLs {
-                    request.addResource(with: .photo, fileURL: jpgURL, options: nil)
-                    request.addResource(with: .pairedVideo, fileURL: movURL, options: nil)
-                } else {
-                    request.addResource(with: .photo, data: jpgData!, options: nil)
-                    request.addResource(with: .pairedVideo, data: movData!, options: nil)
-                }
+                request.addResource(with: .photo, data: jpgData, options: nil)
+                request.addResource(with: .pairedVideo, data: movData, options: nil)
             }, completionHandler: { success, error in
-                if success {
-                    continuation.resume(returning: nil)
+                if let error = error as NSError? {
+                    continuation.resume(throwing: LivePhotoError.photosError(
+                        domain: error.domain, code: error.code,
+                        message: error.localizedDescription))
+                } else if success {
+                    continuation.resume()
                 } else {
-                    continuation.resume(returning: error as NSError?
-                        ?? NSError(domain: "PHPhotosErrorDomain", code: -1,
-                                   userInfo: [NSLocalizedDescriptionKey: "保存失败"]))
+                    continuation.resume(throwing: LivePhotoError.saveFailed)
                 }
             })
         }
@@ -504,12 +484,19 @@ extension LivePhotoSaver {
                 ],
             ]
         } else {
+            // H.264 High profile, level 4.1. The source clip is 1080x1440
+            // High 5.0; the previous build used Main 3.1, whose level
+            // limit is 3600 macroblocks (1280x720) — a 1080x1440 frame
+            // is 6075 macroblocks, so the re-encode was non-conformant
+            // and Photos' converter rejected it (3300). Level 4.1
+            // allows 8192 macroblocks and matches what the iPhone
+            // camera writes for 1080p video.
             videoSettings = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: width,
                 AVVideoHeightKey: height,
                 AVVideoCompressionPropertiesKey: [
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264Main31,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264High41,
                     AVVideoAverageBitRateKey: 8_000_000,
                     AVVideoExpectedSourceFrameRateKey: 30,
                     AVVideoMaxKeyFrameIntervalKey: 30,
