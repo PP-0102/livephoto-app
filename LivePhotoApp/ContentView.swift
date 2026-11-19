@@ -258,9 +258,16 @@ final class ImageViewModel: ObservableObject {
     }
 
     /// Paste the link from the clipboard into the text field.
+    /// Share text copied from Xiaohongshu or Douyin often starts with
+    /// the note title, so pasting it raw fills the field with the title
+    /// and hides the link. Keep only the link when one is in the text,
+    /// so the field shows the link itself.
     func pasteFromClipboard() {
-        if let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty {
+        guard let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return }
+        if let url = ImageResolver.extractLinkURL(from: text) {
+            linkText = url.absoluteString
+        } else {
             linkText = text
         }
     }
@@ -304,8 +311,13 @@ final class ImageViewModel: ObservableObject {
     /// title when the body already starts with it (Douyin uses desc for
     /// both title and body). Xiaohongshu writes each tag as "#xxx#", but
     /// Ctrip's editor turns "#xxx" into a topic chip on its own, so the
-    /// closing "#" is left over as stray text ("#xxx[话题]#") — drop it
-    /// before copying.
+    /// closing "#" is left over as stray text ("#xxx[话题]#"). Tags can
+    /// also run together with no space between them ("#a##b#"). Clean
+    /// them up before copying so every tag is exactly "#xxx" followed
+    /// by a space (or the end of the text):
+    /// 1. drop each tag's closing "#",
+    /// 2. collapse any doubled "#" left over,
+    /// 3. put a space between tags that run together.
     var ctripText: String {
         let title = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -319,9 +331,19 @@ final class ImageViewModel: ObservableObject {
         } else {
             combined = title + "\n\n" + body
         }
-        return combined.replacingOccurrences(
+        let step1 = combined.replacingOccurrences(
             of: #"#([^\s#]+)#"#,
             with: "#$1",
+            options: .regularExpression
+        )
+        let step2 = step1.replacingOccurrences(
+            of: #"#{2,}"#,
+            with: "#",
+            options: .regularExpression
+        )
+        return step2.replacingOccurrences(
+            of: #"([^\s])#(?=[^\s#])"#,
+            with: "$1 #",
             options: .regularExpression
         )
     }
