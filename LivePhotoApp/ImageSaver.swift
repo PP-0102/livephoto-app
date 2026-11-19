@@ -121,8 +121,42 @@ struct ImageSaver {
         }
     }
 
+    /// Download one image item to a temp .jpg file and return its URL.
+    /// The caller owns the file and must delete it when done. Tries the
+    /// original-quality URL first; falls back to the 1080px web version.
+    /// Used to hand the images to the share sheet already attached, so
+    /// the user does not have to pick them by hand in another app.
+    static func downloadImageFile(item: ImageItem) async throws -> URL {
+        let imageData: Data
+        do {
+            imageData = try await downloadImageData(from: item.imageURL)
+        } catch {
+            do {
+                imageData = try await downloadImageData(from: item.fallbackURL)
+            } catch {
+                throw SaverError.downloadFailed
+            }
+        }
+        guard let image = UIImage(data: imageData), let cgImage = image.cgImage else {
+            throw SaverError.invalidImage
+        }
+        let jpgURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".jpg")
+        guard let dest = CGImageDestinationCreateWithURL(
+            jpgURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw SaverError.jpegEncodeFailed
+        }
+        CGImageDestinationSetProperties(
+            dest, [kCGImageDestinationLossyCompressionQuality as String: 0.92] as CFDictionary)
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw SaverError.jpegEncodeFailed
+        }
+        return jpgURL
+    }
+
     /// Download a video to a temp .mp4 file and return its URL.
-    private static func downloadVideoFile(from url: URL) async throws -> URL {
+    static func downloadVideoFile(from url: URL) async throws -> URL {
         let (tempURL, response) = try await URLSession.shared.download(from: url)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw SaverError.downloadFailed
