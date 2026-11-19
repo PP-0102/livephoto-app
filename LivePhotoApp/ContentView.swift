@@ -302,14 +302,28 @@ final class ImageViewModel: ObservableObject {
 
     /// The text copied for Ctrip: title + body, without duplicating the
     /// title when the body already starts with it (Douyin uses desc for
-    /// both title and body).
+    /// both title and body). Xiaohongshu writes each tag as "#xxx#", but
+    /// Ctrip's editor turns "#xxx" into a topic chip on its own, so the
+    /// closing "#" is left over as stray text ("#xxx[话题]#") — drop it
+    /// before copying.
     var ctripText: String {
         let title = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
-        if title.isEmpty { return body }
-        if body.isEmpty { return title }
-        if body == title || body.hasPrefix(title) { return body }
-        return title + "\n\n" + body
+        let combined: String
+        if title.isEmpty {
+            combined = body
+        } else if body.isEmpty {
+            combined = title
+        } else if body == title || body.hasPrefix(title) {
+            combined = body
+        } else {
+            combined = title + "\n\n" + body
+        }
+        return combined.replacingOccurrences(
+            of: #"#([^\s#]+)#"#,
+            with: "#$1",
+            options: .regularExpression
+        )
     }
 
     /// Hand the whole article to Ctrip: copy title + body to the
