@@ -28,9 +28,13 @@ struct VideoItem: Identifiable {
 }
 
 /// Everything parsed from one note: its images and (for a video note) its video.
+/// `title` is the note headline; `bodyText` is the full body text (desc),
+/// kept so the whole article can be handed to another app (e.g. Ctrip).
 struct NoteMedia {
     let images: [ImageItem]
     let video: VideoItem?
+    let title: String
+    let bodyText: String
 }
 
 // MARK: - Errors
@@ -185,7 +189,9 @@ struct ImageResolver {
             }
         }
         guard !items.isEmpty || video != nil else { throw ResolverError.noMedia }
-        return NoteMedia(images: items, video: video)
+        let title = (note["title"] as? String) ?? ""
+        let bodyText = (note["desc"] as? String) ?? ""
+        return NoteMedia(images: items, video: video, title: title, bodyText: bodyText)
     }
 
     /// Parse the video out of a note dictionary. Returns nil for an image

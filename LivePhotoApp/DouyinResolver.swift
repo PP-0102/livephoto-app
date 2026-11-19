@@ -201,7 +201,9 @@ struct DouyinResolver {
             }
         }
         guard !images.isEmpty || video != nil else { throw ResolverError.noMedia }
-        return NoteMedia(images: images, video: video)
+        // Douyin has no separate headline; the desc is both title and body.
+        let text = (note["desc"] as? String) ?? ""
+        return NoteMedia(images: images, video: video, title: text, bodyText: text)
     }
 
     /// Build the video item from a Douyin item dictionary.

@@ -8,6 +8,10 @@ final class ImageViewModel: ObservableObject {
     @Published var linkText = ""
     @Published var items: [ImageItem] = []
     @Published var video: VideoItem? = nil
+    /// Headline and full body text of the parsed note, for the Ctrip hand-off.
+    @Published var noteTitle = ""
+    @Published var noteBody = ""
+    @Published var isSendingToCtrip = false
     @Published var status = ""
     @Published var isParsing = false
     @Published var isSavingAll = false
@@ -67,6 +71,8 @@ final class ImageViewModel: ObservableObject {
         isParsing = true
         items = []
         video = nil
+        noteTitle = ""
+        noteBody = ""
         savedIDs = []
         liveSavedIDs = []
         liveSavingIDs = []
@@ -80,6 +86,8 @@ final class ImageViewModel: ObservableObject {
                 : try await ImageResolver.resolve(link: link)
             items = media.images
             video = media.video
+            noteTitle = media.title
+            noteBody = media.bodyText
             if media.video != nil {
                 status = items.isEmpty
                     ? "找到 1 个视频"
@@ -262,6 +270,8 @@ final class ImageViewModel: ObservableObject {
         linkText = ""
         items = []
         video = nil
+        noteTitle = ""
+        noteBody = ""
         status = ""
         savedIDs = []
         savingIDs = []
@@ -288,6 +298,68 @@ final class ImageViewModel: ObservableObject {
             await saveAllLivePhotos()
         }
         await saveAll()
+    }
+
+    /// The text copied for Ctrip: title + body, without duplicating the
+    /// title when the body already starts with it (Douyin uses desc for
+    /// both title and body).
+    var ctripText: String {
+        let title = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        if title.isEmpty { return body }
+        if body.isEmpty { return title }
+        if body == title || body.hasPrefix(title) { return body }
+        return title + "\n\n" + body
+    }
+
+    /// Hand the whole article to Ctrip: copy title + body to the
+    /// clipboard, save the images/video to Photos, then open the Ctrip
+    /// app. Ctrip offers no public publish API and no deep link that
+    /// accepts a prefilled post, so the last step stays manual: in Ctrip
+    /// tap 发布笔记, pick the photos just saved, paste the text.
+    /// Live Photo items are saved as their stills here (that is what
+    /// Ctrip picks up); video notes save the video.
+    func sendToCtrip() async {
+        guard !isSendingToCtrip, !isParsing, !isSavingAll, !isSavingAllLive else { return }
+        if items.isEmpty && video == nil {
+            await parse()
+        }
+        guard !items.isEmpty || video != nil else { return }
+        isSendingToCtrip = true
+        status = "正在准备转到携程…"
+        LivePhotoLog.shared.append("转到携程：开始准备")
+        // 1. Copy the whole article (title + body) to the clipboard.
+        let text = ctripText
+        if !text.isEmpty {
+            UIPasteboard.general.string = text
+            LivePhotoLog.shared.append("转到携程：已复制标题+正文（\(text.count) 字）")
+        }
+        // 2. Save the media to Photos so Ctrip can pick it.
+        if video != nil {
+            await saveVideo()
+        }
+        if !items.isEmpty {
+            await saveAll()
+        }
+        let savedCount = savedIDs.count + liveSavedIDs.count
+        LivePhotoLog.shared.append("转到携程：已保存 \(savedCount) 张图片到相册" + (isVideoSaved ? "，视频已保存" : ""))
+        // 3. Open the Ctrip app. If it is not installed (or the scheme
+        // is blocked), the text and photos are already ready — tell the
+        // user to open Ctrip by hand instead of failing silently.
+        if let url = URL(string: "ctrip://"), UIApplication.shared.canOpenURL(url) {
+            let opened = await UIApplication.shared.open(url)
+            if opened {
+                status = "已复制好文字，图片已存到相册，正在打开携程…在携程里点「发布笔记」，选图、粘贴文字即可"
+                LivePhotoLog.shared.append("转到携程：已打开携程 App")
+            } else {
+                status = "已复制好文字，图片已存到相册（\(savedCount) 张），请手动打开携程 App 点「发布笔记」"
+                LivePhotoLog.shared.append("转到携程：打开携程失败，请手动打开")
+            }
+        } else {
+            status = "已复制好文字，图片已存到相册（\(savedCount) 张）。没有装携程 App 的话请先安装，再点「发布笔记」"
+            LivePhotoLog.shared.append("转到携程：未装携程 App 或无法打开")
+        }
+        isSendingToCtrip = false
     }
 }
 
@@ -409,6 +481,26 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(viewModel.isSavingAllLive)
+                }
+
+                // Hand the whole article to Ctrip (only when something was parsed)
+                if !viewModel.items.isEmpty || viewModel.video != nil {
+                    Button(action: {
+                        linkFieldFocused = false
+                        Task { await viewModel.sendToCtrip() }
+                    }) {
+                        HStack {
+                            if viewModel.isSendingToCtrip {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                            }
+                            Text(viewModel.isSendingToCtrip ? "正在准备…" : "转到携程发布")
+                                .fontWeight(.semibold)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(viewModel.isSendingToCtrip || viewModel.isParsing || viewModel.isSavingAll || viewModel.isSavingAllLive)
                 }
 
                 // Image list
