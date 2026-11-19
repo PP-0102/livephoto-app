@@ -12,16 +12,6 @@ final class ImageViewModel: ObservableObject {
     @Published var noteTitle = ""
     @Published var noteBody = ""
     @Published var isSendingToCtrip = false
-
-    /// Share sheet for the Ctrip hand-off with the images already
-    /// attached. nil when the sheet is closed.
-    @Published var ctripShareItems: [Any]? = nil
-
-    @Published var isSharingToCtrip = false
-
-    /// Temp image/video files handed to the share sheet. Deleted when
-    /// the sheet closes (see clearCtripShare).
-    private var ctripShareTempFiles: [URL] = []
     @Published var status = ""
     @Published var isParsing = false
     @Published var isSavingAll = false
@@ -386,82 +376,6 @@ final class ImageViewModel: ObservableObject {
         isSendingToCtrip = false
     }
 
-    /// Share the whole article to Ctrip with the images already
-    /// attached, so nothing has to be picked by hand. Downloads the
-    /// images (and video) to temp files, then opens the system share
-    /// sheet with the text + files; the user taps Ctrip in the sheet.
-    /// This is the only way iOS lets one app hand images to another
-    /// app pre-attached — no app can pre-select images inside Ctrip's
-    /// own album picker. Whether Ctrip accepts the share is up to
-    /// Ctrip: if its icon does not appear in the sheet, or the images
-    /// do not arrive, use 转到携程发布 and pick them by hand instead.
-    /// The text is also copied to the clipboard as a backup, in case
-    /// Ctrip's share entry drops it.
-    func shareToCtrip() async {
-        guard !isSharingToCtrip, !isSendingToCtrip, !isParsing, !isSavingAll, !isSavingAllLive else { return }
-        if items.isEmpty && video == nil {
-            await parse()
-        }
-        guard !items.isEmpty || video != nil else { return }
-        isSharingToCtrip = true
-        status = "正在准备分享到携程…"
-        LivePhotoLog.shared.append("分享到携程：开始准备")
-        let text = ctripText
-        if !text.isEmpty {
-            UIPasteboard.general.string = text
-        }
-        var shareItems: [Any] = []
-        if !text.isEmpty { shareItems.append(text) }
-        var tempFiles: [URL] = []
-        var failed = 0
-        for item in items {
-            do {
-                let file = try await ImageSaver.downloadImageFile(item: item)
-                tempFiles.append(file)
-                shareItems.append(file)
-            } catch {
-                failed += 1
-            }
-        }
-        if let video {
-            do {
-                let file = try await ImageSaver.downloadVideoFile(from: video.videoURL)
-                tempFiles.append(file)
-                shareItems.append(file)
-            } catch {
-                do {
-                    let file = try await ImageSaver.downloadVideoFile(from: video.fallbackURL)
-                    tempFiles.append(file)
-                    shareItems.append(file)
-                } catch {
-                    failed += 1
-                }
-            }
-        }
-        isSharingToCtrip = false
-        guard !tempFiles.isEmpty else {
-            status = "图片下载失败，请检查网络后重试"
-            LivePhotoLog.shared.append("分享到携程：图片全部下载失败")
-            return
-        }
-        ctripShareTempFiles = tempFiles
-        ctripShareItems = shareItems
-        if failed > 0 {
-            status = "已准备好 \(tempFiles.count) 张图片（\(failed) 张下载失败），请在分享里点携程"
-        } else {
-            status = "图片已准备好（\(tempFiles.count) 张），请在分享里点携程"
-        }
-        LivePhotoLog.shared.append("分享到携程：已准备 \(tempFiles.count) 个文件，打开分享面板")
-    }
-
-    /// Close the Ctrip share sheet and delete its temp files.
-    func clearCtripShare() {
-        for file in ctripShareTempFiles {
-            try? FileManager.default.removeItem(at: file)
-        }
-        ctripShareTempFiles = []
-        ctripShareItems = nil
-    }
 }
 
 // MARK: - View
@@ -604,28 +518,6 @@ struct ContentView: View {
                     .disabled(viewModel.isSendingToCtrip || viewModel.isParsing || viewModel.isSavingAll || viewModel.isSavingAllLive)
                 }
 
-                // Share the article to Ctrip with the images already
-                // attached (only when something was parsed). Opens the
-                // system share sheet — tap Ctrip there, no picking.
-                if !viewModel.items.isEmpty || viewModel.video != nil {
-                    Button(action: {
-                        linkFieldFocused = false
-                        Task { await viewModel.shareToCtrip() }
-                    }) {
-                        HStack {
-                            if viewModel.isSharingToCtrip {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                            }
-                            Text(viewModel.isSharingToCtrip ? "正在准备…" : "分享到携程（图已选好）")
-                                .fontWeight(.semibold)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.isSharingToCtrip || viewModel.isSendingToCtrip || viewModel.isParsing || viewModel.isSavingAll || viewModel.isSavingAllLive)
-                }
-
                 // Image list
                 List(viewModel.items) { item in
                     ImageRow(
@@ -657,14 +549,6 @@ struct ContentView: View {
             )) {
                 if let url = viewModel.livpShareURL {
                     ShareSheet(url: url)
-                }
-            }
-            .sheet(isPresented: Binding(
-                get: { viewModel.ctripShareItems != nil },
-                set: { if !$0 { viewModel.clearCtripShare() } }
-            )) {
-                if let items = viewModel.ctripShareItems {
-                    MultiShareSheet(items: items)
                 }
             }
             .sheet(isPresented: $viewModel.isShowingLog) {
@@ -913,18 +797,6 @@ struct ShareSheet: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
         UIActivityViewController(activityItems: [url], applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController,
-                                context: Context) {}
-}
-
-/// Share sheet for several items at once (text + image/video files).
-struct MultiShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController,
