@@ -309,15 +309,12 @@ final class ImageViewModel: ObservableObject {
 
     /// The text copied for Ctrip: title + body, without duplicating the
     /// title when the body already starts with it (Douyin uses desc for
-    /// both title and body). Xiaohongshu writes each tag as "#xxx#", but
-    /// Ctrip's editor turns "#xxx" into a topic chip on its own, so the
-    /// closing "#" is left over as stray text ("#xxx[话题]#"). Tags can
-    /// also run together with no space between them ("#a##b#"). Clean
-    /// them up before copying so every tag is exactly "#xxx" followed
-    /// by a space (or the end of the text):
-    /// 1. drop each tag's closing "#",
-    /// 2. collapse any doubled "#" left over,
-    /// 3. put a space between tags that run together.
+    /// both title and body). Hashtags are removed entirely: Ctrip's
+    /// editor turns every "#xxx" into a topic chip on its own, and the
+    /// closing "#" Xiaohongshu puts after each tag is left over as stray
+    /// text ("#xxx[话题]#"), so keeping the tags can never come out
+    /// clean. Removing a tag also removes one space before it, and the
+    /// spacing left behind is tidied up.
     var ctripText: String {
         let title = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -331,21 +328,27 @@ final class ImageViewModel: ObservableObject {
         } else {
             combined = title + "\n\n" + body
         }
-        let step1 = combined.replacingOccurrences(
-            of: #"#([^\s#]+)#"#,
-            with: "#$1",
+        let noTags = combined.replacingOccurrences(
+            of: #" ?#[^\s#。，、；：！？,.!?;:]+#?"#,
+            with: "",
             options: .regularExpression
         )
-        let step2 = step1.replacingOccurrences(
-            of: #"#{2,}"#,
-            with: "#",
+        let tidy1 = noTags.replacingOccurrences(
+            of: #" +\n"#,
+            with: "\n",
             options: .regularExpression
         )
-        return step2.replacingOccurrences(
-            of: #"([^\s])#(?=[^\s#])"#,
-            with: "$1 #",
+        let tidy2 = tidy1.replacingOccurrences(
+            of: #"\n +"#,
+            with: "\n",
             options: .regularExpression
         )
+        let tidy3 = tidy2.replacingOccurrences(
+            of: #" {2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
+        return tidy3.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Hand the whole article to Ctrip: copy title + body to the
