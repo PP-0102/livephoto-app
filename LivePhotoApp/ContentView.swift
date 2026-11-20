@@ -408,6 +408,8 @@ final class ImageViewModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var viewModel = ImageViewModel()
     @FocusState private var linkFieldFocused: Bool
+    /// The image currently shown in the full-screen preview (tap a thumbnail).
+    @State private var previewItem: ImageItem? = nil
 
     var body: some View {
         NavigationView {
@@ -560,14 +562,20 @@ struct ContentView: View {
                         },
                         onExportLivp: {
                             Task { await viewModel.exportLivp(item: item) }
+                        },
+                        onPreview: {
+                            previewItem = item
                         }
                     )
                 }
                 .listStyle(.plain)
             }
             .padding()
-            .navigationTitle("图片下载")
+            .navigationTitle("图片视频下载")
             .navigationBarTitleDisplayMode(.inline)
+            .fullScreenCover(item: $previewItem) { item in
+                ImagePreviewView(item: item)
+            }
             .sheet(isPresented: Binding(
                 get: { viewModel.livpShareURL != nil },
                 set: { if !$0 { viewModel.livpShareURL = nil } }
@@ -672,10 +680,14 @@ struct ImageRow: View {
     let onSave: () -> Void
     let onSaveLive: () -> Void
     let onExportLivp: () -> Void
+    /// Tap the thumbnail to open the full-screen preview.
+    let onPreview: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             // Thumbnail (WebP; UIImage decodes it on iOS 14+).
+            // Tap it to open the full-screen preview (original quality,
+            // pinch to zoom).
             AsyncImage(url: item.imageURL) { phase in
                 switch phase {
                 case .success(let image):
@@ -692,6 +704,7 @@ struct ImageRow: View {
             .frame(width: 72, height: 96)
             .clipped()
             .cornerRadius(8)
+            .onTapGesture(perform: onPreview)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -767,6 +780,100 @@ struct ImageRow: View {
             .disabled(isSaved || isSaving)
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// Full-screen image preview: tap a thumbnail in the list to open it.
+/// Shows the original-quality image. Pinch to zoom (1x–5x), drag to pan
+/// while zoomed, double-tap to toggle between 1x and 2x, tap the × at
+/// the top right to close.
+struct ImagePreviewView: View {
+    let item: ImageItem
+    @Environment(\.dismiss) private var dismiss
+    @State private var scale: CGFloat = 1
+    @State private var lastScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            AsyncImage(url: item.imageURL) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFit()
+                case .failure:
+                    Image(systemName: "photo")
+                        .font(.largeTitle)
+                        .foregroundColor(.white.opacity(0.6))
+                default:
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+            .scaleEffect(scale)
+            .offset(offset)
+            .gesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        scale = max(1, min(lastScale * value, 5))
+                    }
+                    .onEnded { _ in
+                        lastScale = scale
+                        if scale == 1 {
+                            offset = .zero
+                            lastOffset = .zero
+                        }
+                    }
+            )
+            .simultaneousGesture(
+                DragGesture()
+                    .onChanged { value in
+                        guard scale > 1 else { return }
+                        offset = CGSize(
+                            width: lastOffset.width + value.translation.width,
+                            height: lastOffset.height + value.translation.height
+                        )
+                    }
+                    .onEnded { _ in
+                        lastOffset = offset
+                    }
+            )
+            .onTapGesture(count: 2) {
+                if scale > 1 {
+                    scale = 1
+                    lastScale = 1
+                    offset = .zero
+                    lastOffset = .zero
+                } else {
+                    scale = 2
+                    lastScale = 2
+                }
+            }
+
+            VStack {
+                HStack {
+                    Text("图片 \(item.id)")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    Spacer()
+                    Button(action: { dismiss() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.white.opacity(0.9))
+                    }
+                }
+                .padding()
+                Spacer()
+                Text("双指捏合放大缩小 · 双击放大 · 拖动移动")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.7))
+                    .padding(.bottom, 28)
+            }
+        }
     }
 }
 
